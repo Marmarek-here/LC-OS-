@@ -41,19 +41,21 @@ SRC_DIR  := src
 BUILD    := build
 ISO_DIR  := iso
 FS_DIR   := ../fs
-FS_IMAGE := $(BUILD)/fs.iso
+FS_IMAGE := $(BUILD)/fs.img
+FS_TREE := $(shell find $(FS_DIR) -mindepth 1 | sort)
+FS_FILES := $(shell find $(FS_DIR) -mindepth 1 -type f | sort)
 
-CFLAGS += -I$(BUILD)
+CFLAGS += -I$(BUILD) -I$(SRC_DIR)
 
 KERNEL_ELF := $(BUILD)/lcos.elf
 ISO_IMG    := lcos.iso
 FS_HEADER   := $(BUILD)/filesystem_entries.h
 FS_DATA_HEADER := $(BUILD)/filesystem_data.h
 
-OBJS := $(BUILD)/boot.o $(BUILD)/kernel.o
+OBJS := $(BUILD)/boot.o $(BUILD)/interrupts.o $(BUILD)/kernel.o $(BUILD)/shell.o $(BUILD)/builtin_commands.o $(BUILD)/vga.o $(BUILD)/games.o
 
 # ─────────────────────────────────────────────────────────────────────────────
-.PHONY: all iso run clean
+.PHONY: all iso run run-i386 run-x86_64 clean
 
 all: $(KERNEL_ELF) $(FS_IMAGE)
 
@@ -61,10 +63,25 @@ all: $(KERNEL_ELF) $(FS_IMAGE)
 $(BUILD)/boot.o: $(SRC_DIR)/boot.asm | $(BUILD)
 	$(NASM) $(NASMFLAGS) $< -o $@
 
+$(BUILD)/interrupts.o: $(SRC_DIR)/interrupts.asm | $(BUILD)
+	$(NASM) $(NASMFLAGS) $< -o $@
+
 $(BUILD)/kernel.o: $(SRC_DIR)/kernel.c $(FS_HEADER) $(FS_DATA_HEADER) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(FS_HEADER): | $(BUILD)
+$(BUILD)/shell.o: $(SRC_DIR)/shell.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/builtin_commands.o: $(SRC_DIR)/commands/builtin_commands.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/vga.o: $(SRC_DIR)/vga.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/games.o: $(SRC_DIR)/games.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(FS_HEADER): $(FS_TREE) | $(BUILD)
 	mkdir -p $(FS_DIR)
 	@{ \
 	    printf '/* Auto-generated filesystem hierarchy - do not edit */\n\n'; \
@@ -81,7 +98,7 @@ $(FS_HEADER): | $(BUILD)
 	    printf '    {0, 0}\n};\n\n'; \
 	} > $@
 
-$(FS_DATA_HEADER): | $(BUILD)
+$(FS_DATA_HEADER): $(FS_FILES) | $(BUILD)
 	mkdir -p $(FS_DIR)
 	@{ \
 	    printf '/* Auto-generated file contents and entries - do not edit */\n\n'; \
@@ -115,8 +132,10 @@ $(FS_DATA_HEADER): | $(BUILD)
 	    printf '    {0, 0, 0, 0}\n};\n'; \
 	} > $@
 
-$(FS_IMAGE): | $(BUILD)
-	xorriso -as mkisofs -o $@ $(FS_DIR)
+$(FS_IMAGE): $(FS_TREE) | $(BUILD)
+	rm -f $@
+	mformat -i $@ -f 1440 -C ::
+	mcopy -i $@ -s $(FS_DIR)/* ::
 
 # ── Link ──────────────────────────────────────────────────────────────────────
 $(KERNEL_ELF): $(OBJS)
@@ -126,16 +145,29 @@ $(KERNEL_ELF): $(OBJS)
 # ── Create bootable ISO ───────────────────────────────────────────────────────
 iso: $(KERNEL_ELF) $(FS_IMAGE)
 	cp $(KERNEL_ELF) $(ISO_DIR)/boot/lcos.elf
-	cp $(FS_IMAGE) $(ISO_DIR)/boot/fs.iso
+	cp $(FS_IMAGE) $(ISO_DIR)/boot/fs.img
 	grub-mkrescue -o $(ISO_IMG) $(ISO_DIR)
 	@echo "[OK] ISO image: $(ISO_IMG)"
 
 # ── Run in QEMU ───────────────────────────────────────────────────────────────
 run: $(ISO_IMG)
+	$(MAKE) run-x86_64
+
+run-x86_64: $(ISO_IMG)
 	qemu-system-x86_64 \
 	    -cdrom $(ISO_IMG) \
 	    -m 128M \
-	    -display sdl \
+	    -vga std \
+	    -display gtk,zoom-to-fit=on,full-screen=on \
+	    -no-reboot \
+	    -no-shutdown
+
+run-i386: $(ISO_IMG)
+	qemu-system-i386 \
+	    -cdrom $(ISO_IMG) \
+	    -m 128M \
+	    -vga std \
+	    -display gtk,zoom-to-fit=on,full-screen=on \
 	    -no-reboot \
 	    -no-shutdown
 

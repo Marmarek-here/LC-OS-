@@ -4,69 +4,58 @@
  * VGA terminal with polled keyboard input.
  */
 
-typedef unsigned char  uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int   uint32_t;
-
+#include "commands/builtin_commands.h"
+#include "games.h"
+#include "os_api.h"
+#include "shell.h"
+#include "types.h"
+#include "vga.h"
 #include "filesystem_entries.h"
 #include "filesystem_data.h"
 
-#define VGA_BASE           ((volatile uint16_t *)0xB8000)
-#define VGA_COLS           80
-#define VGA_ROWS           25
 #define VGA_ATTR_LOGO      0x0F
 #define VGA_ATTR_TEXT      0x07
 #define VGA_ATTR_MUTED     0x07
 #define VGA_ATTR_STATUS    0x0A
 #define VGA_ATTR_PROMPT    0x0E
-#define STATUS_ROW         10
-#define TERM_TOP           11
-#define TERM_BOTTOM        24
-#define INPUT_MAX          63
+#define VGA_ATTR_DIR       0x0E
+#define VGA_ATTR_FILE      0x0B
 #define PROMPT_SIZE        2
 #define CURSOR_BLINK_DELAY 3000000
 
 #define PS2_DATA_PORT      0x60
 #define PS2_STATUS_PORT    0x64
+#define CMOS_INDEX_PORT    0x70
+#define CMOS_DATA_PORT     0x71
+
+#define MULTIBOOT2_BOOTLOADER_MAGIC 0x36D76289
+
+#define MULTIBOOT2_TAG_TYPE_END     0
+#define MULTIBOOT2_TAG_TYPE_MODULE  3
 
 #define VGA_CRTC_INDEX     0x3D4
 #define VGA_CRTC_DATA      0x3D5
 
-enum key_type {
-    KEY_NONE = 0,
-    KEY_CHAR,
-    KEY_ENTER,
-    KEY_BACKSPACE,
-    KEY_TAB,
-    KEY_LEFT,
-    KEY_RIGHT,
-    KEY_UP,
-    KEY_DOWN,
-    KEY_CAPSLOCK
-};
+static uint32_t ui_status_row = 10;
+static uint32_t term_top_row = 11;
+static uint32_t term_bottom_row = 24;
 
-struct key_event {
-    enum key_type type;
-    char ch;
-    uint8_t code;
-    uint8_t has_code;
-    const char *label;
-};
-
-static uint32_t term_row = TERM_TOP;
+static uint32_t term_row = 11;
 static uint32_t term_col = 0;
-static char input_buffer[INPUT_MAX + 1];
-static uint32_t input_length = 0;
-static uint32_t input_cursor = 0;
+static uint32_t input_start_row = 11;
+static uint32_t input_rendered_rows = 1;
 static int caps_lock_enabled = 0;
 static uint8_t cursor_visible = 0;
 static uint16_t cursor_saved_cell = 0;
-static uint32_t cursor_saved_row = TERM_TOP;
+static uint32_t cursor_saved_row = 11;
 static uint32_t cursor_saved_col = PROMPT_SIZE;
 static uint32_t cursor_blink_ticks = 0;
+static int cpu_x86_64_capable = 0;
 
-/* Filesystem and directory management */
-static char current_dir[INPUT_MAX + 1] = "/";
+static const uint8_t *fat12_image = 0;
+static uint32_t fat12_image_size = 0;
+static char fat12_file_buffer[2048];
+
 #define MAX_DIRS 16
 #define MAX_FILES 32
 static char directories[MAX_DIRS][INPUT_MAX + 1];
@@ -112,21 +101,51 @@ struct idt_ptr {
     uint32_t base;
 } __attribute__((packed));
 
+struct multiboot2_tag {
+    uint32_t type;
+    uint32_t size;
+} __attribute__((packed));
+
+struct multiboot2_tag_module {
+    uint32_t type;
+    uint32_t size;
+    uint32_t mod_start;
+    uint32_t mod_end;
+    char cmdline[1];
+} __attribute__((packed));
+
+struct fat12_context {
+    uint16_t bytes_per_sector;
+    uint8_t sectors_per_cluster;
+    uint16_t reserved_sectors;
+    uint8_t fat_count;
+    uint16_t root_entry_count;
+    uint16_t sectors_per_fat;
+    uint32_t total_sectors;
+    uint32_t root_dir_sectors;
+    uint32_t first_root_sector;
+    uint32_t first_data_sector;
+};
+
+struct fat12_entry {
+    uint8_t attr;
+    uint16_t first_cluster;
+    uint32_t size;
+};
+
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_ptr idtp;
 
+extern void (*exception_stub_table[])(void);
 extern void interrupt_ignore_stub(void);
 extern void irq0_stub(void);
 extern void irq1_stub(void);
 
 static struct key_event keyboard_decode(uint8_t raw_scancode);
 static void keyboard_event_push(struct key_event event);
-static int keyboard_event_pop(struct key_event *event);
-
-static inline uint16_t vga_entry(char c, uint8_t attr)
-{
-    return (uint16_t)(((uint16_t)attr << 8) | (uint8_t)c);
-}
+static const char *fat12_get_file_content(const char *path);
+static void cursor_disable(void);
+static void u32_to_hex(uint32_t value, char *buffer);
 
 static inline uint8_t inb(uint16_t port)
 {
@@ -139,6 +158,11 @@ static inline uint8_t inb(uint16_t port)
 static inline void outb(uint16_t port, uint8_t value)
 {
     __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline void outw(uint16_t port, uint16_t value)
+{
+    __asm__ volatile ("outw %0, %1" : : "a"(value), "Nd"(port));
 }
 
 static inline void io_wait(void)
@@ -154,6 +178,62 @@ static inline void interrupts_enable(void)
 static inline void interrupts_disable(void)
 {
     __asm__ volatile ("cli");
+}
+
+static uint32_t term_cols(void)
+{
+    return vga_cols();
+}
+
+static uint32_t term_rows(void)
+{
+    return vga_rows();
+}
+
+static void init_layout(void)
+{
+    uint32_t rows = term_rows();
+
+    if (rows >= 15) {
+        ui_status_row = 10;
+        term_top_row = 11;
+    } else if (rows >= 6) {
+        ui_status_row = rows - 4;
+        term_top_row = rows - 3;
+    } else {
+        ui_status_row = rows - 1;
+        term_top_row = rows - 1;
+    }
+
+    term_bottom_row = rows - 1;
+    if (term_top_row > term_bottom_row)
+        term_top_row = term_bottom_row;
+
+    term_row = term_top_row;
+    input_start_row = term_top_row;
+    cursor_saved_row = term_top_row;
+}
+
+static void cpuid(uint32_t leaf, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+{
+    __asm__ volatile ("cpuid"
+                      : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
+                      : "a"(leaf));
+}
+
+static int cpu_has_long_mode(void)
+{
+    uint32_t eax;
+    uint32_t ebx;
+    uint32_t ecx;
+    uint32_t edx;
+
+    cpuid(0x80000000u, &eax, &ebx, &ecx, &edx);
+    if (eax < 0x80000001u)
+        return 0;
+
+    cpuid(0x80000001u, &eax, &ebx, &ecx, &edx);
+    return (edx & (1u << 29)) != 0;
 }
 
 static void scheduler_tick(void)
@@ -230,12 +310,18 @@ static void pic_remap(void)
 static void interrupts_init(void)
 {
     uint32_t i;
+    uint16_t code_selector;
 
-    for (i = 0; i < IDT_ENTRIES; i++)
-        idt_set_gate((uint8_t)i, (uint32_t)interrupt_ignore_stub, 0x08, 0x8E);
+    __asm__ volatile ("mov %%cs, %0" : "=r"(code_selector));
 
-    idt_set_gate(0x20, (uint32_t)irq0_stub, 0x08, 0x8E);
-    idt_set_gate(0x21, (uint32_t)irq1_stub, 0x08, 0x8E);
+    for (i = 0; i < 32; i++)
+        idt_set_gate((uint8_t)i, (uint32_t)exception_stub_table[i], code_selector, 0x8E);
+
+    for (i = 32; i < IDT_ENTRIES; i++)
+        idt_set_gate((uint8_t)i, (uint32_t)interrupt_ignore_stub, code_selector, 0x8E);
+
+    idt_set_gate(0x20, (uint32_t)irq0_stub, code_selector, 0x8E);
+    idt_set_gate(0x21, (uint32_t)irq1_stub, code_selector, 0x8E);
 
     idtp.limit = (uint16_t)(sizeof(idt) - 1);
     idtp.base = (uint32_t)idt;
@@ -265,59 +351,66 @@ void irq1_handler_c(void)
     outb(PIC1_CMD, PIC_EOI);
 }
 
-static inline uint16_t vga_get_at(uint32_t row, uint32_t col)
+void exception_handler_c(uint32_t vector, uint32_t error_code)
 {
-    return VGA_BASE[row * VGA_COLS + col];
-}
+    static const char *const exception_names[32] = {
+        "Divide Error",
+        "Debug",
+        "Non-Maskable Interrupt",
+        "Breakpoint",
+        "Overflow",
+        "BOUND Range Exceeded",
+        "Invalid Opcode",
+        "Device Not Available",
+        "Double Fault",
+        "Coprocessor Segment Overrun",
+        "Invalid TSS",
+        "Segment Not Present",
+        "Stack-Segment Fault",
+        "General Protection Fault",
+        "Page Fault",
+        "Reserved",
+        "x87 Floating-Point Exception",
+        "Alignment Check",
+        "Machine Check",
+        "SIMD Floating-Point Exception",
+        "Virtualization Exception",
+        "Control Protection Exception",
+        "Reserved",
+        "Reserved",
+        "Reserved",
+        "Reserved",
+        "Reserved",
+        "Reserved",
+        "Hypervisor Injection Exception",
+        "VMM Communication Exception",
+        "Security Exception",
+        "Reserved"
+    };
+    char vector_hex[11];
+    char error_hex[11];
 
-static void vga_put_at(char c, uint8_t attr, uint32_t row, uint32_t col)
-{
-    VGA_BASE[row * VGA_COLS + col] = vga_entry(c, attr);
-}
+    interrupts_disable();
+    cursor_disable();
+    vga_clear();
 
-static void vga_clear_row(uint32_t row, uint8_t attr)
-{
-    uint32_t col;
+    u32_to_hex(vector, vector_hex);
+    u32_to_hex(error_code, error_hex);
 
-    for (col = 0; col < VGA_COLS; col++)
-        vga_put_at(' ', attr, row, col);
-}
+    vga_puts_at("Unhandled CPU exception", VGA_ATTR_TEXT, 2, 2);
+    if (vector < 32)
+        vga_puts_at(exception_names[vector], VGA_ATTR_TEXT, 4, 2);
+    else
+        vga_puts_at("Unknown exception", VGA_ATTR_TEXT, 4, 2);
+    vga_puts_at("Vector:", VGA_ATTR_TEXT, 6, 2);
+    vga_puts_at(vector_hex, VGA_ATTR_TEXT, 6, 10);
+    vga_puts_at("Error:", VGA_ATTR_TEXT, 7, 2);
+    vga_puts_at(error_hex, VGA_ATTR_TEXT, 7, 10);
+    vga_puts_at("System halted to avoid a reboot loop.", VGA_ATTR_TEXT, 9, 2);
 
-static void vga_clear(void)
-{
-    uint32_t row;
-
-    for (row = 0; row < VGA_ROWS; row++)
-        vga_clear_row(row, 0x00);
-}
-
-static void vga_puts_at(const char *s, uint8_t attr, uint32_t row, uint32_t col)
-{
-    while (*s && row < VGA_ROWS) {
-        if (*s == '\n') {
-            row++;
-            col = 0;
-            s++;
-            continue;
-        }
-
-        if (col >= VGA_COLS) {
-            row++;
-            col = 0;
-            if (row >= VGA_ROWS)
-                break;
-        }
-
-        vga_put_at(*s, attr, row, col);
-        col++;
-        s++;
+    for (;;) {
+        __asm__ volatile ("hlt");
     }
-}
-
-static void boot_marker(uint32_t row, const char *text)
-{
-    vga_clear_row(row, 0x00);
-    vga_puts_at(text, VGA_ATTR_STATUS, row, 0);
 }
 
 static uint32_t str_len(const char *s)
@@ -330,11 +423,21 @@ static uint32_t str_len(const char *s)
     return length;
 }
 
+static uint32_t text_len(const char *s)
+{
+    uint32_t n = 0;
+
+    while (s[n])
+        n++;
+
+    return n;
+}
+
 static void u32_to_dec(uint32_t value, char *buffer)
 {
-    char reversed[11];
+    char tmp[11];
     uint32_t count = 0;
-    uint32_t index;
+    uint32_t i;
 
     if (value == 0) {
         buffer[0] = '0';
@@ -342,15 +445,197 @@ static void u32_to_dec(uint32_t value, char *buffer)
         return;
     }
 
-    while (value > 0) {
-        reversed[count++] = (char)('0' + (value % 10));
+    while (value > 0 && count < 10) {
+        tmp[count++] = (char)('0' + (value % 10));
         value /= 10;
     }
 
-    for (index = 0; index < count; index++)
-        buffer[index] = reversed[count - index - 1];
+    for (i = 0; i < count; i++)
+        buffer[i] = tmp[count - i - 1];
 
     buffer[count] = '\0';
+}
+
+static void u32_to_hex(uint32_t value, char *buffer)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    int shift;
+
+    buffer[0] = '0';
+    buffer[1] = 'x';
+
+    for (shift = 0; shift < 8; shift++) {
+        uint32_t nibble = (value >> ((7 - shift) * 4)) & 0x0Fu;
+        buffer[shift + 2] = digits[nibble];
+    }
+
+    buffer[10] = '\0';
+}
+
+static uint8_t cmos_read(uint8_t reg)
+{
+    outb(CMOS_INDEX_PORT, (uint8_t)(reg | 0x80));
+    return inb(CMOS_DATA_PORT);
+}
+
+static uint8_t bcd_to_bin(uint8_t value)
+{
+    return (uint8_t)(((value >> 4) * 10u) + (value & 0x0Fu));
+}
+
+static void write_two_digits(char *out, uint32_t *index, uint8_t value)
+{
+    out[*index] = (char)('0' + (value / 10u));
+    (*index)++;
+    out[*index] = (char)('0' + (value % 10u));
+    (*index)++;
+}
+
+static void rtc_read(uint8_t *second,
+                     uint8_t *minute,
+                     uint8_t *hour,
+                     uint8_t *day,
+                     uint8_t *month,
+                     uint8_t *year)
+{
+    uint8_t reg_b;
+    uint8_t pm_flag;
+    uint8_t sec1;
+    uint8_t min1;
+    uint8_t hour1;
+    uint8_t day1;
+    uint8_t month1;
+    uint8_t year1;
+    uint8_t sec2;
+    uint8_t min2;
+    uint8_t hour2;
+    uint8_t day2;
+    uint8_t month2;
+    uint8_t year2;
+
+    do {
+        while (cmos_read(0x0A) & 0x80)
+            ;
+
+        sec1 = cmos_read(0x00);
+        min1 = cmos_read(0x02);
+        hour1 = cmos_read(0x04);
+        day1 = cmos_read(0x07);
+        month1 = cmos_read(0x08);
+        year1 = cmos_read(0x09);
+
+        while (cmos_read(0x0A) & 0x80)
+            ;
+
+        sec2 = cmos_read(0x00);
+        min2 = cmos_read(0x02);
+        hour2 = cmos_read(0x04);
+        day2 = cmos_read(0x07);
+        month2 = cmos_read(0x08);
+        year2 = cmos_read(0x09);
+    } while (sec1 != sec2 || min1 != min2 || hour1 != hour2 || day1 != day2 || month1 != month2 || year1 != year2);
+
+    reg_b = cmos_read(0x0B);
+
+    pm_flag = (uint8_t)(hour1 & 0x80);
+
+    if ((reg_b & 0x04) == 0) {
+        sec1 = bcd_to_bin(sec1);
+        min1 = bcd_to_bin(min1);
+        hour1 = bcd_to_bin((uint8_t)(hour1 & 0x7F));
+        day1 = bcd_to_bin(day1);
+        month1 = bcd_to_bin(month1);
+        year1 = bcd_to_bin(year1);
+    } else {
+        hour1 = (uint8_t)(hour1 & 0x7F);
+    }
+
+    if ((reg_b & 0x02) == 0) {
+        if (pm_flag && hour1 < 12)
+            hour1 = (uint8_t)(hour1 + 12);
+        if (!pm_flag && hour1 == 12)
+            hour1 = 0;
+    }
+
+    *second = sec1;
+    *minute = min1;
+    *hour = hour1;
+    *day = day1;
+    *month = month1;
+    *year = year1;
+}
+
+static int rtc_values_valid(uint8_t second,
+                            uint8_t minute,
+                            uint8_t hour,
+                            uint8_t day,
+                            uint8_t month)
+{
+    if (second > 59)
+        return 0;
+    if (minute > 59)
+        return 0;
+    if (hour > 23)
+        return 0;
+    if (month == 0 || month > 12)
+        return 0;
+    if (day == 0 || day > 31)
+        return 0;
+
+    return 1;
+}
+
+void os_time_get_date(char *out, uint32_t out_size)
+{
+    uint8_t second;
+    uint8_t minute;
+    uint8_t hour;
+    uint8_t day;
+    uint8_t month;
+    uint8_t year;
+    uint32_t i = 0;
+
+    if (out_size < 20) {
+        if (out_size > 0)
+            out[0] = '\0';
+        return;
+    }
+
+    uint32_t tries = 0;
+
+    while (tries < 8) {
+        rtc_read(&second, &minute, &hour, &day, &month, &year);
+        if (rtc_values_valid(second, minute, hour, day, month))
+            break;
+        tries++;
+    }
+
+    if (tries == 8) {
+        const char *fallback = "RTC unavailable";
+        uint32_t k = 0;
+
+        while (fallback[k] && k + 1 < out_size) {
+            out[k] = fallback[k];
+            k++;
+        }
+        out[k] = '\0';
+        return;
+    }
+
+    write_two_digits(out, &i, day);
+    out[i++] = '-';
+    write_two_digits(out, &i, month);
+    out[i++] = '-';
+    out[i++] = '2';
+    out[i++] = '0';
+    write_two_digits(out, &i, year);
+    out[i++] = ' ';
+    write_two_digits(out, &i, hour);
+    out[i++] = ':';
+    write_two_digits(out, &i, minute);
+    out[i++] = ':';
+    write_two_digits(out, &i, second);
+    out[i] = '\0';
 }
 
 static void cursor_disable(void)
@@ -359,19 +644,24 @@ static void cursor_disable(void)
     outb(VGA_CRTC_DATA, 0x20);
 }
 
+static void input_linear_to_row_col(uint32_t linear_index, uint32_t *row, uint32_t *col)
+{
+    uint32_t cols = term_cols();
+
+    *row = input_start_row + (linear_index / cols);
+    *col = linear_index % cols;
+
+    if (*row > term_bottom_row) {
+        *row = term_bottom_row;
+        *col = cols - 1;
+    }
+}
+
 static void cursor_position(uint32_t *row, uint32_t *col)
 {
-    uint32_t prompt_len = 0;
-    
-    /* Calculate actual prompt length: current_dir + " > " */
-    while (current_dir[prompt_len])
-        prompt_len++;
-    prompt_len += 3; /* for " > " */
-    
-    *row = term_row;
-    *col = prompt_len + input_cursor;
-    if (*col >= VGA_COLS)
-        *col = VGA_COLS - 1;
+    uint32_t linear = shell_prompt_length() + shell_input_cursor();
+
+    input_linear_to_row_col(linear, row, col);
 }
 
 static void cursor_hide(void)
@@ -379,7 +669,7 @@ static void cursor_hide(void)
     if (!cursor_visible)
         return;
 
-    VGA_BASE[cursor_saved_row * VGA_COLS + cursor_saved_col] = cursor_saved_cell;
+    vga_set_cell(cursor_saved_row, cursor_saved_col, cursor_saved_cell);
     cursor_visible = 0;
 }
 
@@ -395,7 +685,7 @@ static void cursor_show(void)
         return;
 
     cursor_position(&row, &col);
-    cell = vga_get_at(row, col);
+    cell = vga_get_cell(row, col);
     ch = (uint8_t)(cell & 0xFF);
     attr = (uint8_t)((cell >> 8) & 0xFF);
 
@@ -404,9 +694,9 @@ static void cursor_show(void)
     cursor_saved_cell = cell;
 
     if (ch == ' ')
-        VGA_BASE[row * VGA_COLS + col] = vga_entry(' ', 0x70);
+        vga_set_cell(row, col, vga_entry(' ', 0x70));
     else
-        VGA_BASE[row * VGA_COLS + col] = vga_entry((char)ch, (uint8_t)((attr << 4) | (attr >> 4)));
+        vga_set_cell(row, col, vga_entry((char)ch, (uint8_t)((attr << 4) | (attr >> 4))));
 
     cursor_visible = 1;
 }
@@ -435,15 +725,16 @@ static void scroll_terminal(void)
 {
     uint32_t row;
     uint32_t col;
+    uint32_t cols = term_cols();
 
-    for (row = TERM_TOP; row < TERM_BOTTOM; row++) {
-        for (col = 0; col < VGA_COLS; col++)
-            VGA_BASE[row * VGA_COLS + col] = VGA_BASE[(row + 1) * VGA_COLS + col];
+    for (row = term_top_row; row < term_bottom_row; row++) {
+        for (col = 0; col < cols; col++)
+            vga_set_cell(row, col, vga_get_cell(row + 1, col));
     }
 
-    vga_clear_row(TERM_BOTTOM, 0x00);
+    vga_clear_row(term_bottom_row, 0x00);
 
-    if (term_row > TERM_TOP)
+    if (term_row > term_top_row)
         term_row--;
 }
 
@@ -452,7 +743,7 @@ static void term_newline(void)
     term_row++;
     term_col = 0;
 
-    if (term_row > TERM_BOTTOM)
+    if (term_row > term_bottom_row)
         scroll_terminal();
 }
 
@@ -463,7 +754,7 @@ static void term_putc(char c, uint8_t attr)
         return;
     }
 
-    if (term_col >= VGA_COLS)
+    if (term_col >= term_cols())
         term_newline();
 
     vga_put_at(c, attr, term_row, term_col);
@@ -488,10 +779,12 @@ static void draw_logo(void)
         0
     };
     uint32_t row;
+    uint32_t cols = term_cols();
+    uint32_t rows = term_rows();
 
-    for (row = 0; logo[row] != 0; row++) {
+    for (row = 0; logo[row] != 0 && row < rows; row++) {
         uint32_t width = str_len(logo[row]);
-        uint32_t col = (VGA_COLS - width) / 2;
+        uint32_t col = (cols > width) ? ((cols - width) / 2) : 0;
 
         vga_puts_at(logo[row], VGA_ATTR_LOGO, row, col);
     }
@@ -500,86 +793,114 @@ static void draw_logo(void)
 static void draw_ui(void)
 {
     uint32_t col;
+    uint32_t cols = term_cols();
+    uint32_t rows = term_rows();
 
-    vga_puts_at("LC(OS) polling terminal", VGA_ATTR_TEXT, 7, 2);
-    vga_puts_at("Keys: arrows move, Tab inserts spaces, Caps Lock toggles case.",
-                VGA_ATTR_TEXT, 8, 2);
+    if (rows > 8)
+        vga_puts_at("Type 'help' to see available commands.", VGA_ATTR_TEXT, 8, 2);
 
-    for (col = 0; col < VGA_COLS; col++)
-        vga_put_at('-', VGA_ATTR_TEXT, 9, col);
+    if (rows > 9) {
+        for (col = 0; col < cols; col++)
+            vga_put_at('-', VGA_ATTR_TEXT, 9, col);
+    }
 
-    vga_clear_row(STATUS_ROW, 0x00);
+    vga_clear_row(ui_status_row, 0x00);
 }
 
 static void draw_status(const struct key_event *event)
 {
-    char decimal[11];
+    (void)event;
 
     cursor_hide();
 
-    vga_clear_row(STATUS_ROW, 0x00);
-    vga_puts_at("Last key:", VGA_ATTR_STATUS, STATUS_ROW, 0);
-
-    if (event->type == KEY_CHAR) {
-        vga_put_at('\'', VGA_ATTR_STATUS, STATUS_ROW, 10);
-        vga_put_at(event->ch, VGA_ATTR_STATUS, STATUS_ROW, 11);
-        vga_put_at('\'', VGA_ATTR_STATUS, STATUS_ROW, 12);
-    } else if (event->label != 0) {
-        vga_puts_at(event->label, VGA_ATTR_STATUS, STATUS_ROW, 10);
-    } else {
-        vga_puts_at("none", VGA_ATTR_STATUS, STATUS_ROW, 10);
-    }
-
-    vga_puts_at(" Code:", VGA_ATTR_STATUS, STATUS_ROW, 24);
-    if (event->has_code) {
-        u32_to_dec((uint32_t)event->code, decimal);
-        vga_puts_at(decimal, VGA_ATTR_STATUS, STATUS_ROW, 31);
-    } else {
-        vga_puts_at("N/A", VGA_ATTR_STATUS, STATUS_ROW, 31);
-    }
-
-    vga_puts_at(" Caps:", VGA_ATTR_STATUS, STATUS_ROW, 40);
-    vga_puts_at(caps_lock_enabled ? "ON" : "OFF", VGA_ATTR_STATUS, STATUS_ROW, 47);
+    vga_clear_row(ui_status_row, 0x00);
+    vga_puts_at("Caps: ", VGA_ATTR_STATUS, ui_status_row, 0);
+    vga_puts_at(caps_lock_enabled ? "ON" : "OFF", VGA_ATTR_STATUS, ui_status_row, 6);
     cursor_show();
-}
-
-static void prompt_reset(void)
-{
-    input_length = 0;
-    input_cursor = 0;
-    input_buffer[0] = '\0';
 }
 
 static void redraw_input_line(void)
 {
+    uint32_t prompt_len;
+    uint32_t input_len;
+    uint32_t linear_len;
+    uint32_t required_rows;
+    uint32_t clear_rows;
+    uint32_t row_offset;
+    uint32_t linear = 0;
+    uint32_t i;
     uint32_t index;
+
+    if (shell_input_length() == 0 && shell_input_cursor() == 0) {
+        input_start_row = term_row;
+        input_rendered_rows = 1;
+    }
+
+    prompt_len = shell_prompt_length();
+    input_len = shell_input_length();
+    linear_len = prompt_len + input_len;
+    required_rows = linear_len / term_cols();
+    if ((linear_len % term_cols()) != 0 || required_rows == 0)
+        required_rows++;
+
+    clear_rows = input_rendered_rows;
+    if (required_rows > clear_rows)
+        clear_rows = required_rows;
 
     cursor_hide();
 
-    vga_clear_row(term_row, 0x00);
-    term_col = 0;
-    
-    /* Show current directory before prompt */
-    term_puts(current_dir, VGA_ATTR_PROMPT);
-    term_puts(" > ", VGA_ATTR_PROMPT);
+    for (row_offset = 0; row_offset < clear_rows; row_offset++) {
+        uint32_t row = input_start_row + row_offset;
+        if (row > term_bottom_row)
+            break;
+        vga_clear_row(row, 0x00);
+    }
 
-    for (index = 0; index < input_length; index++)
-        term_putc(input_buffer[index], VGA_ATTR_MUTED);
+    for (index = 0; shell_current_dir()[index] != '\0'; index++) {
+        uint32_t row;
+        uint32_t col;
+
+        input_linear_to_row_col(linear, &row, &col);
+        vga_put_at(shell_current_dir()[index], VGA_ATTR_PROMPT, row, col);
+        linear++;
+    }
+
+    for (index = 0; index < 3; index++) {
+        uint32_t row;
+        uint32_t col;
+        char prompt_ch = (index == 1) ? '>' : ' ';
+
+        input_linear_to_row_col(linear, &row, &col);
+        vga_put_at(prompt_ch, VGA_ATTR_PROMPT, row, col);
+        linear++;
+    }
+
+    for (i = 0; i < input_len; i++) {
+        uint32_t row;
+        uint32_t col;
+
+        input_linear_to_row_col(linear, &row, &col);
+        vga_put_at(shell_input_char_at(i), VGA_ATTR_MUTED, row, col);
+        linear++;
+    }
+
+    term_row = input_start_row + required_rows - 1;
+    if (term_row > term_bottom_row)
+        term_row = term_bottom_row;
+
+    term_col = linear % term_cols();
+    input_rendered_rows = required_rows;
 
     cursor_reset_blink();
 }
 
 static void term_prompt(void)
 {
-    term_row = TERM_TOP;
+    term_row = term_top_row;
     term_col = 0;
-    prompt_reset();
+    input_start_row = term_row;
+    input_rendered_rows = 1;
     redraw_input_line();
-}
-
-static int char_is_space(char ch)
-{
-    return ch == ' ' || ch == '\t';
 }
 
 static int str_eq(const char *left, const char *right)
@@ -606,6 +927,386 @@ static void str_copy(char *dst, const char *src)
     *dst = '\0';
 }
 
+static char to_upper_ascii(char ch)
+{
+    if (ch >= 'a' && ch <= 'z')
+        return (char)(ch - ('a' - 'A'));
+
+    return ch;
+}
+
+static int str_contains(const char *text, const char *needle)
+{
+    uint32_t i = 0;
+
+    if (needle[0] == '\0')
+        return 1;
+
+    while (text[i]) {
+        uint32_t j = 0;
+
+        while (needle[j] && text[i + j] == needle[j])
+            j++;
+
+        if (needle[j] == '\0')
+            return 1;
+
+        i++;
+    }
+
+    return 0;
+}
+
+static uint16_t read_u16_le(const uint8_t *ptr)
+{
+    return (uint16_t)(ptr[0] | (uint16_t)(ptr[1] << 8));
+}
+
+static uint32_t read_u32_le(const uint8_t *ptr)
+{
+    return (uint32_t)ptr[0] |
+           ((uint32_t)ptr[1] << 8) |
+           ((uint32_t)ptr[2] << 16) |
+           ((uint32_t)ptr[3] << 24);
+}
+
+static void fat12_init_from_multiboot(uint32_t magic, uint32_t info_addr)
+{
+    const uint8_t *info;
+    uint32_t total_size;
+    uint32_t offset;
+
+    fat12_image = 0;
+    fat12_image_size = 0;
+
+    if (magic != MULTIBOOT2_BOOTLOADER_MAGIC || info_addr == 0)
+        return;
+
+    info = (const uint8_t *)info_addr;
+    total_size = read_u32_le(info);
+    if (total_size < 16)
+        return;
+
+    offset = 8;
+    while (offset + 8 <= total_size) {
+        const struct multiboot2_tag *tag = (const struct multiboot2_tag *)(info + offset);
+        uint32_t aligned_size;
+
+        if (tag->type == MULTIBOOT2_TAG_TYPE_END)
+            break;
+
+        if (tag->size < 8)
+            break;
+
+        if (tag->type == MULTIBOOT2_TAG_TYPE_MODULE) {
+            const struct multiboot2_tag_module *module = (const struct multiboot2_tag_module *)tag;
+            uint32_t module_size = module->mod_end - module->mod_start;
+
+            if (module->mod_end > module->mod_start &&
+                (str_contains(module->cmdline, "fsimg") || fat12_image == 0)) {
+                fat12_image = (const uint8_t *)module->mod_start;
+                fat12_image_size = module_size;
+            }
+        }
+
+        aligned_size = (tag->size + 7) & ~7u;
+        if (aligned_size == 0 || offset > total_size - aligned_size)
+            break;
+        offset += aligned_size;
+    }
+}
+
+static int fat12_load_context(struct fat12_context *ctx)
+{
+    uint16_t total16;
+    uint32_t total32;
+
+    if (fat12_image == 0 || fat12_image_size < 512)
+        return 0;
+
+    ctx->bytes_per_sector = read_u16_le(&fat12_image[11]);
+    ctx->sectors_per_cluster = fat12_image[13];
+    ctx->reserved_sectors = read_u16_le(&fat12_image[14]);
+    ctx->fat_count = fat12_image[16];
+    ctx->root_entry_count = read_u16_le(&fat12_image[17]);
+    total16 = read_u16_le(&fat12_image[19]);
+    ctx->sectors_per_fat = read_u16_le(&fat12_image[22]);
+    total32 = read_u32_le(&fat12_image[32]);
+
+    if (ctx->bytes_per_sector == 0 || ctx->sectors_per_cluster == 0 ||
+        ctx->fat_count == 0 || ctx->sectors_per_fat == 0)
+        return 0;
+
+    ctx->total_sectors = total16 ? total16 : total32;
+    if (ctx->total_sectors == 0)
+        return 0;
+
+    ctx->root_dir_sectors =
+        (uint32_t)((ctx->root_entry_count * 32u + (ctx->bytes_per_sector - 1u)) / ctx->bytes_per_sector);
+    ctx->first_root_sector = ctx->reserved_sectors + ((uint32_t)ctx->fat_count * ctx->sectors_per_fat);
+    ctx->first_data_sector = ctx->first_root_sector + ctx->root_dir_sectors;
+
+    return 1;
+}
+
+static int fat12_sector_ptr(const struct fat12_context *ctx, uint32_t sector, const uint8_t **ptr)
+{
+    uint32_t offset = sector * (uint32_t)ctx->bytes_per_sector;
+
+    if (offset >= fat12_image_size)
+        return 0;
+    if (fat12_image_size - offset < ctx->bytes_per_sector)
+        return 0;
+
+    *ptr = fat12_image + offset;
+    return 1;
+}
+
+static int fat12_name_matches(const uint8_t *entry, const char *segment, uint32_t segment_len)
+{
+    char built_name[13];
+    uint32_t out = 0;
+    uint32_t i;
+    uint32_t dot_needed = 0;
+
+    if (segment_len == 0 || segment_len > 12)
+        return 0;
+
+    for (i = 0; i < 8; i++) {
+        if (entry[i] == ' ')
+            break;
+        built_name[out++] = (char)entry[i];
+    }
+
+    for (i = 0; i < 3; i++) {
+        if (entry[8 + i] != ' ') {
+            dot_needed = 1;
+            break;
+        }
+    }
+
+    if (dot_needed)
+        built_name[out++] = '.';
+
+    for (i = 0; i < 3; i++) {
+        if (entry[8 + i] == ' ')
+            break;
+        built_name[out++] = (char)entry[8 + i];
+    }
+    built_name[out] = '\0';
+
+    if (out != segment_len)
+        return 0;
+
+    for (i = 0; i < out; i++) {
+        if (to_upper_ascii(segment[i]) != to_upper_ascii(built_name[i]))
+            return 0;
+    }
+
+    return 1;
+}
+
+static int fat12_next_cluster(const struct fat12_context *ctx, uint16_t cluster, uint16_t *next)
+{
+    uint32_t fat_offset = cluster + (cluster / 2u);
+    uint32_t fat_byte_offset = ((uint32_t)ctx->reserved_sectors * ctx->bytes_per_sector) + fat_offset;
+    uint16_t value;
+
+    if (fat_byte_offset + 1 >= fat12_image_size)
+        return 0;
+
+    value = (uint16_t)(fat12_image[fat_byte_offset] | ((uint16_t)fat12_image[fat_byte_offset + 1] << 8));
+    if (cluster & 1)
+        value >>= 4;
+    else
+        value &= 0x0FFF;
+
+    *next = value;
+    return 1;
+}
+
+static int fat12_find_in_directory(const struct fat12_context *ctx,
+                                   uint16_t dir_cluster,
+                                   const char *segment,
+                                   uint32_t segment_len,
+                                   struct fat12_entry *found)
+{
+    uint32_t entry_index;
+
+    if (dir_cluster == 0) {
+        uint32_t root_entries = ctx->root_entry_count;
+
+        for (entry_index = 0; entry_index < root_entries; entry_index++) {
+            uint32_t byte_offset = (ctx->first_root_sector * (uint32_t)ctx->bytes_per_sector) + (entry_index * 32u);
+            const uint8_t *entry;
+
+            if (byte_offset + 32 > fat12_image_size)
+                break;
+
+            entry = fat12_image + byte_offset;
+            if (entry[0] == 0x00)
+                break;
+            if (entry[0] == 0xE5)
+                continue;
+            if ((entry[11] & 0x0F) == 0x0F)
+                continue;
+            if (entry[11] & 0x08)
+                continue;
+
+            if (fat12_name_matches(entry, segment, segment_len)) {
+                found->attr = entry[11];
+                found->first_cluster = read_u16_le(&entry[26]);
+                found->size = read_u32_le(&entry[28]);
+                return 1;
+            }
+        }
+
+        return 0;
+    }
+
+    while (dir_cluster >= 2 && dir_cluster < 0xFF8) {
+        uint32_t first_sector = ctx->first_data_sector +
+                                ((uint32_t)(dir_cluster - 2u) * ctx->sectors_per_cluster);
+        uint32_t sector;
+
+        for (sector = 0; sector < ctx->sectors_per_cluster; sector++) {
+            const uint8_t *sector_ptr;
+            uint32_t offset;
+
+            if (!fat12_sector_ptr(ctx, first_sector + sector, &sector_ptr))
+                return 0;
+
+            for (offset = 0; offset < ctx->bytes_per_sector; offset += 32) {
+                const uint8_t *entry = sector_ptr + offset;
+
+                if (entry[0] == 0x00)
+                    return 0;
+                if (entry[0] == 0xE5)
+                    continue;
+                if ((entry[11] & 0x0F) == 0x0F)
+                    continue;
+                if (entry[11] & 0x08)
+                    continue;
+
+                if (fat12_name_matches(entry, segment, segment_len)) {
+                    found->attr = entry[11];
+                    found->first_cluster = read_u16_le(&entry[26]);
+                    found->size = read_u32_le(&entry[28]);
+                    return 1;
+                }
+            }
+        }
+
+        if (!fat12_next_cluster(ctx, dir_cluster, &dir_cluster))
+            return 0;
+    }
+
+    return 0;
+}
+
+static int fat12_find_path(const struct fat12_context *ctx, const char *path, struct fat12_entry *entry)
+{
+    uint16_t current_cluster = 0;
+    const char *p = path;
+
+    if (p[0] != '/')
+        return 0;
+
+    while (*p == '/')
+        p++;
+
+    if (*p == '\0')
+        return 0;
+
+    while (*p) {
+        const char *segment_start = p;
+        uint32_t segment_len = 0;
+        int last_segment;
+
+        while (p[segment_len] && p[segment_len] != '/')
+            segment_len++;
+
+        last_segment = (p[segment_len] == '\0');
+
+        if (!fat12_find_in_directory(ctx, current_cluster, segment_start, segment_len, entry))
+            return 0;
+
+        if (last_segment)
+            return 1;
+
+        if ((entry->attr & 0x10) == 0)
+            return 0;
+
+        if (entry->first_cluster < 2)
+            return 0;
+
+        current_cluster = entry->first_cluster;
+        p += segment_len;
+        while (*p == '/')
+            p++;
+    }
+
+    return 0;
+}
+
+static const char *fat12_get_file_content(const char *path)
+{
+    struct fat12_context ctx;
+    struct fat12_entry entry;
+    uint32_t remaining;
+    uint32_t written = 0;
+    uint16_t cluster;
+
+    if (!fat12_load_context(&ctx))
+        return 0;
+
+    if (!fat12_find_path(&ctx, path, &entry))
+        return 0;
+
+    if (entry.attr & 0x10)
+        return 0;
+
+    if (entry.size >= sizeof(fat12_file_buffer))
+        remaining = sizeof(fat12_file_buffer) - 1;
+    else
+        remaining = entry.size;
+
+    cluster = entry.first_cluster;
+    while (remaining > 0 && cluster >= 2 && cluster < 0xFF8) {
+        uint32_t first_sector = ctx.first_data_sector +
+                                ((uint32_t)(cluster - 2u) * ctx.sectors_per_cluster);
+        uint32_t sector;
+
+        for (sector = 0; sector < ctx.sectors_per_cluster && remaining > 0; sector++) {
+            const uint8_t *sector_ptr;
+            uint32_t copy_count;
+            uint32_t i;
+
+            if (!fat12_sector_ptr(&ctx, first_sector + sector, &sector_ptr))
+                return 0;
+
+            copy_count = remaining;
+            if (copy_count > ctx.bytes_per_sector)
+                copy_count = ctx.bytes_per_sector;
+
+            for (i = 0; i < copy_count; i++)
+                fat12_file_buffer[written + i] = (char)sector_ptr[i];
+
+            written += copy_count;
+            remaining -= copy_count;
+        }
+
+        if (remaining == 0)
+            break;
+
+        if (!fat12_next_cluster(&ctx, cluster, &cluster))
+            return 0;
+    }
+
+    fat12_file_buffer[written] = '\0';
+    return fat12_file_buffer;
+}
+
 /* Find file content by full path */
 static const char *find_file_content(const char *filepath)
 {
@@ -622,7 +1323,9 @@ static struct InMemFile *find_memory_file(const char *filepath);
 
 static int file_exists_builtin(const char *filepath)
 {
-    return find_file_content(filepath) != 0;
+    if (find_file_content(filepath) != 0)
+        return 1;
+    return fat12_get_file_content(filepath) != 0;
 }
 
 static int file_exists_any(const char *filepath)
@@ -637,7 +1340,7 @@ static int dir_exists(const char *dirpath)
 {
     uint32_t i;
 
-    if (str_eq(dirpath, "/") || str_eq(dirpath, "/commands") || str_eq(dirpath, "/programs"))
+    if (str_eq(dirpath, "/"))
         return 1;
     
     /* Check built-in directories */
@@ -750,6 +1453,7 @@ static int str_starts_with(const char *text, const char *prefix)
 static int resolve_path(const char *arg, char *out)
 {
     uint32_t arg_len = str_len(arg);
+    const char *current_dir = shell_current_dir();
     uint32_t cwd_len = str_len(current_dir);
 
     if (str_eq(arg, "..")) {
@@ -937,50 +1641,118 @@ static int is_direct_child_path(const char *parent, const char *child)
     return 1;
 }
 
+static const char *path_basename(const char *path)
+{
+    const char *name = path;
+
+    while (*path) {
+        if (*path == '/')
+            name = path + 1;
+        path++;
+    }
+
+    return name;
+}
+
+static void print_file_with_size(const char *name, uint32_t size, int show_sizes)
+{
+    char size_dec[11];
+
+    term_puts(name, VGA_ATTR_FILE);
+    if (show_sizes) {
+        term_puts(" (", VGA_ATTR_MUTED);
+        u32_to_dec(size, size_dec);
+        term_puts(size_dec, VGA_ATTR_MUTED);
+        term_puts(" B)", VGA_ATTR_MUTED);
+    }
+    term_newline();
+}
+
+static uint32_t path_parent_length(const char *path)
+{
+    uint32_t i = 0;
+    uint32_t last_slash = 0;
+
+    while (path[i]) {
+        if (path[i] == '/')
+            last_slash = i;
+        i++;
+    }
+
+    return last_slash;
+}
+
+static int path_is_under(const char *prefix, const char *path)
+{
+    uint32_t i = 0;
+
+    if (str_eq(prefix, "/"))
+        return path[0] == '/';
+
+    while (prefix[i]) {
+        if (path[i] != prefix[i])
+            return 0;
+        i++;
+    }
+
+    return path[i] == '\0' || path[i] == '/';
+}
+
+static int path_build_join(const char *left, const char *right_name, char *out)
+{
+    uint32_t left_len = str_len(left);
+    uint32_t right_len = str_len(right_name);
+    uint32_t i;
+    uint32_t pos = 0;
+
+    if (str_eq(left, "/")) {
+        if (1 + right_len > INPUT_MAX)
+            return 0;
+        out[pos++] = '/';
+    } else {
+        if (left_len + 1 + right_len > INPUT_MAX)
+            return 0;
+        for (i = 0; i < left_len; i++)
+            out[pos++] = left[i];
+        out[pos++] = '/';
+    }
+
+    for (i = 0; i < right_len; i++)
+        out[pos++] = right_name[i];
+
+    out[pos] = '\0';
+    return 1;
+}
+
+static const char *get_file_content_any(const char *path)
+{
+    struct InMemFile *mem_file = find_memory_file(path);
+    const char *builtin_file;
+
+    if (mem_file)
+        return mem_file->content;
+
+    builtin_file = find_file_content(path);
+    if (builtin_file)
+        return builtin_file;
+
+    return fat12_get_file_content(path);
+}
+
 /* List files and subdirectories in a given directory */
-static void list_directory(const char *dirpath)
+static void list_directory_internal(const char *dirpath, int show_sizes)
 {
     uint32_t i, j;
     int found_any = 0;
 
-    if (str_eq(dirpath, "/")) {
-        term_puts("[commands]", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("[programs]", VGA_ATTR_TEXT);
-        term_newline();
-        found_any = 1;
-    }
-
-    if (str_eq(dirpath, "/commands")) {
-        term_puts("help", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("ls", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("echo", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("mkdir", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("rmdir", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("rmfile", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("cd", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("read", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("touch", VGA_ATTR_TEXT);
-        found_any = 1;
-    }
-
-    /* List built-in subdirectories. */
     i = 0;
     while (fs_directories[i].name != 0) {
         const char *subdir_path = fs_directories[i].path;
 
         if (is_direct_child_path(dirpath, subdir_path)) {
-            term_puts("[", VGA_ATTR_TEXT);
-            term_puts(fs_directories[i].name, VGA_ATTR_TEXT);
-            term_puts("]", VGA_ATTR_TEXT);
+            term_puts(fs_directories[i].name, VGA_ATTR_DIR);
+            if (show_sizes)
+                term_puts(" (<DIR>)", VGA_ATTR_MUTED);
             term_newline();
             found_any = 1;
         }
@@ -988,18 +1760,15 @@ static void list_directory(const char *dirpath)
         i++;
     }
 
-    /* List built-in files. */
     i = 0;
     while (fs_files[i].name != 0) {
         if (str_eq(fs_files[i].dir_path, dirpath) && find_memory_file(fs_files[i].path) == 0) {
-            term_puts(fs_files[i].name, VGA_ATTR_TEXT);
-            term_newline();
+            print_file_with_size(fs_files[i].name, text_len(fs_files[i].content), show_sizes);
             found_any = 1;
         }
         i++;
     }
 
-    /* List in-memory created directories. */
     for (i = 0; i < dir_count; i++) {
         const char *mem_dir = directories[i];
 
@@ -1013,548 +1782,328 @@ static void list_directory(const char *dirpath)
                 start = len + 1;
             }
 
-            term_puts("[", VGA_ATTR_TEXT);
-            term_puts(&mem_dir[start], VGA_ATTR_TEXT);
-            term_puts("]", VGA_ATTR_TEXT);
+            term_puts(&mem_dir[start], VGA_ATTR_DIR);
+            if (show_sizes)
+                term_puts(" (<DIR>)", VGA_ATTR_MUTED);
             term_newline();
             found_any = 1;
         }
     }
 
-    /* List in-memory created files. */
     for (i = 0; i < file_count; i++) {
-        const char *file_dir = in_memory_files[i].path;
-        uint32_t last_slash = 0;
-        uint32_t k = 0;
-        
-        /* Find parent directory from file path */
-        while (file_dir[k]) {
-            if (file_dir[k] == '/')
-                last_slash = k;
-            k++;
-        }
-        
-        /* Extract parent dir */
+        const char *file_path = in_memory_files[i].path;
+        uint32_t parent_len = path_parent_length(file_path);
         char parent_dir[INPUT_MAX + 1];
-        if (last_slash == 0) {
+
+        if (parent_len == 0) {
             parent_dir[0] = '/';
             parent_dir[1] = '\0';
         } else {
-            for (j = 0; j < last_slash; j++)
-                parent_dir[j] = file_dir[j];
-            parent_dir[last_slash] = '\0';
+            for (j = 0; j < parent_len; j++)
+                parent_dir[j] = file_path[j];
+            parent_dir[parent_len] = '\0';
         }
-        
+
         if (str_eq(parent_dir, dirpath)) {
-            const char *filename = &file_dir[last_slash + 1];
-            term_puts(filename, VGA_ATTR_TEXT);
-            term_newline();
+            const char *filename = &file_path[parent_len + 1];
+            print_file_with_size(filename, in_memory_files[i].content_len, show_sizes);
             found_any = 1;
         }
     }
-    
-    if (!found_any) {
+
+    if (!found_any)
         term_puts("<empty>", VGA_ATTR_MUTED);
-    }
 }
 
-static void execute_command(const char *input)
+static int copy_file_internal(const char *src, const char *dst)
 {
-    char command[INPUT_MAX + 1];
-    char command_name[INPUT_MAX + 1];
-    uint32_t command_length = 0;
-    const char *args;
+    const char *content = get_file_content_any(src);
 
-    while (*input && char_is_space(*input))
-        input++;
+    if (content == 0)
+        return 0;
 
-    while (input[command_length] && !char_is_space(input[command_length])) {
-        command[command_length] = input[command_length];
-        command_length++;
-    }
-    command[command_length] = '\0';
+    return write_memory_file(dst, content);
+}
 
-    args = input + command_length;
-    while (*args && char_is_space(*args))
-        args++;
+static int copy_directory_tree(const char *src_dir, const char *dst_dir)
+{
+    uint32_t i;
 
-    if (command[0] == '\0')
-        return;
+    if (!dir_exists(dst_dir))
+        add_directory(dst_dir);
+    if (!dir_exists(dst_dir))
+        return 0;
 
-    if (str_starts_with(command, "/programs/")) {
-        term_puts("Program execution not implemented yet: ", VGA_ATTR_MUTED);
-        term_puts(command, VGA_ATTR_MUTED);
-        return;
-    }
+    i = 0;
+    while (fs_files[i].name != 0) {
+        if (str_eq(fs_files[i].dir_path, src_dir) && find_memory_file(fs_files[i].path) == 0) {
+            char dst_file[INPUT_MAX + 1];
 
-    if (str_starts_with(command, "/commands/")) {
-        str_copy(command_name, command + 10);
-    } else {
-        str_copy(command_name, command);
+            if (!path_build_join(dst_dir, fs_files[i].name, dst_file))
+                return 0;
+            if (!copy_file_internal(fs_files[i].path, dst_file))
+                return 0;
+        }
+        i++;
     }
 
-    if (str_eq(command_name, "help")) {
-        term_puts("Built-in commands:", VGA_ATTR_MUTED);
-        term_newline();
-        term_puts("help      - show available commands", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("ls        - list files/directories", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("echo      - print text or write to file", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("mkdir     - create a directory", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("cd        - change directory", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("cd ..     - go to parent directory", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("read      - read file contents", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("touch     - create empty file", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("rmdir     - remove empty directory", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("rmfile    - remove non-directory file", VGA_ATTR_TEXT);
-        term_newline();
-        term_puts("Use /commands/<name> form or bare name", VGA_ATTR_TEXT);
-        return;
-    }
+    for (i = 0; i < file_count; i++) {
+        const char *file_path = in_memory_files[i].path;
+        uint32_t parent_len = path_parent_length(file_path);
+        char parent_dir[INPUT_MAX + 1];
 
-    if (str_eq(command_name, "ls")) {
-        list_directory(current_dir);
-        return;
-    }
-
-    if (str_eq(command_name, "mkdir")) {
-        char dirname[INPUT_MAX + 1];
-        char fullpath[INPUT_MAX + 1];
-        uint32_t dlen = 0;
-        const char *arg_start = args;
-        
-        while (*arg_start && !char_is_space(*arg_start)) {
-            dirname[dlen] = *arg_start;
-            dlen++;
-            arg_start++;
-        }
-        dirname[dlen] = '\0';
-
-        if (dlen == 0) {
-            term_puts("Usage: mkdir <dirname>", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!resolve_path(dirname, fullpath)) {
-            term_puts("Path too long", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (file_exists_any(fullpath)) {
-            term_puts("Cannot create directory, file exists: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (dir_exists(fullpath)) {
-            term_puts("Directory already exists: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        add_directory(fullpath);
-        term_puts("Created directory: ", VGA_ATTR_TEXT);
-        term_puts(fullpath, VGA_ATTR_TEXT);
-        return;
-    }
-
-    if (str_eq(command_name, "cd")) {
-        char dirname[INPUT_MAX + 1];
-        char fullpath[INPUT_MAX + 1];
-        uint32_t dlen = 0;
-        const char *arg_start = args;
-        
-        while (*arg_start && !char_is_space(*arg_start)) {
-            dirname[dlen] = *arg_start;
-            dlen++;
-            arg_start++;
-        }
-        dirname[dlen] = '\0';
-
-        if (dlen == 0) {
-            term_puts("Usage: cd <dirname>", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!resolve_path(dirname, fullpath)) {
-            term_puts("Path too long", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!dir_exists(fullpath)) {
-            term_puts("Directory not found: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        str_copy(current_dir, fullpath);
-        term_puts("Changed to: ", VGA_ATTR_TEXT);
-        term_puts(current_dir, VGA_ATTR_TEXT);
-        return;
-    }
-
-    if (str_eq(command_name, "read")) {
-        char filename[INPUT_MAX + 1];
-        char fullpath[INPUT_MAX + 1];
-        const char *content;
-        struct InMemFile *mem_file;
-        uint32_t flen = 0;
-        const char *arg_start = args;
-        
-        while (*arg_start && !char_is_space(*arg_start)) {
-            filename[flen] = *arg_start;
-            flen++;
-            arg_start++;
-        }
-        filename[flen] = '\0';
-
-        if (flen == 0) {
-            term_puts("Usage: read <filename>", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!resolve_path(filename, fullpath)) {
-            term_puts("Path too long", VGA_ATTR_MUTED);
-            return;
-        }
-
-        /* Check in-memory files first */
-        mem_file = find_memory_file(fullpath);
-        if (mem_file) {
-            term_puts(mem_file->content, VGA_ATTR_TEXT);
-            return;
-        }
-
-        /* Then check built-in files */
-        content = find_file_content(fullpath);
-        if (!content) {
-            term_puts("File not found: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        term_puts(content, VGA_ATTR_TEXT);
-        return;
-    }
-
-    if (str_eq(command_name, "touch")) {
-        char filename[INPUT_MAX + 1];
-        char fullpath[INPUT_MAX + 1];
-        uint32_t flen = 0;
-        const char *arg_start = args;
-        
-        while (*arg_start && !char_is_space(*arg_start)) {
-            filename[flen] = *arg_start;
-            flen++;
-            arg_start++;
-        }
-        filename[flen] = '\0';
-
-        if (flen == 0) {
-            term_puts("Usage: touch <filename>", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!resolve_path(filename, fullpath)) {
-            term_puts("Path too long", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (dir_exists(fullpath)) {
-            term_puts("Cannot create file, directory exists: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (find_memory_file(fullpath) || file_exists_builtin(fullpath)) {
-            term_puts("File already exists: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!write_memory_file(fullpath, "")) {
-            term_puts("Failed to create file (storage full)", VGA_ATTR_MUTED);
-            return;
-        }
-
-        term_puts("Created: ", VGA_ATTR_TEXT);
-        term_puts(fullpath, VGA_ATTR_TEXT);
-        return;
-    }
-
-    if (str_eq(command_name, "rmdir")) {
-        char dirname[INPUT_MAX + 1];
-        char fullpath[INPUT_MAX + 1];
-        uint32_t dlen = 0;
-        const char *arg_start = args;
-
-        while (*arg_start && !char_is_space(*arg_start)) {
-            dirname[dlen] = *arg_start;
-            dlen++;
-            arg_start++;
-        }
-        dirname[dlen] = '\0';
-
-        if (dlen == 0) {
-            term_puts("Usage: rmdir <dirname>", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!resolve_path(dirname, fullpath)) {
-            term_puts("Path too long", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (str_eq(fullpath, "/")) {
-            term_puts("Cannot remove root directory", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!dir_exists(fullpath)) {
-            term_puts("Directory not found: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (dir_is_builtin(fullpath)) {
-            term_puts("Cannot remove built-in directory: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (dir_has_entries(fullpath)) {
-            term_puts("Directory not empty: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!remove_memory_dir(fullpath)) {
-            term_puts("Failed to remove directory: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        term_puts("Removed directory: ", VGA_ATTR_TEXT);
-        term_puts(fullpath, VGA_ATTR_TEXT);
-        return;
-    }
-
-    if (str_eq(command_name, "rmfile")) {
-        char filename[INPUT_MAX + 1];
-        char fullpath[INPUT_MAX + 1];
-        uint32_t flen = 0;
-        const char *arg_start = args;
-
-        while (*arg_start && !char_is_space(*arg_start)) {
-            filename[flen] = *arg_start;
-            flen++;
-            arg_start++;
-        }
-        filename[flen] = '\0';
-
-        if (flen == 0) {
-            term_puts("Usage: rmfile <filename>", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!resolve_path(filename, fullpath)) {
-            term_puts("Path too long", VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (dir_exists(fullpath)) {
-            term_puts("rmfile only removes files: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (file_exists_builtin(fullpath)) {
-            term_puts("Cannot remove built-in file: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        if (!remove_memory_file(fullpath)) {
-            term_puts("File not found: ", VGA_ATTR_MUTED);
-            term_puts(fullpath, VGA_ATTR_MUTED);
-            return;
-        }
-
-        term_puts("Removed file: ", VGA_ATTR_TEXT);
-        term_puts(fullpath, VGA_ATTR_TEXT);
-        return;
-    }
-
-    /* Handle echo with redirection: echo text > file.txt */
-    if (str_eq(command_name, "echo")) {
-        char echo_text[INPUT_MAX + 1];
-        char filename[INPUT_MAX + 1];
-        char fullpath[INPUT_MAX + 1];
-        const char *redirect_ptr;
-        int existed = 0;
-        uint32_t text_len = 0;
-        uint32_t file_len = 0;
-        
-        /* Look for > character */
-        redirect_ptr = args;
-        while (*redirect_ptr && *redirect_ptr != '>') {
-            echo_text[text_len] = *redirect_ptr;
-            text_len++;
-            redirect_ptr++;
-        }
-        echo_text[text_len] = '\0';
-        
-        /* Trim trailing space from text */
-        while (text_len > 0 && echo_text[text_len - 1] == ' ')
-            text_len--;
-        echo_text[text_len] = '\0';
-        
-        if (*redirect_ptr == '>') {
-            /* Redirection mode: echo text > file */
-            redirect_ptr++; /* Skip the > */
-            while (*redirect_ptr && char_is_space(*redirect_ptr))
-                redirect_ptr++; /* Skip spaces */
-            
-            /* Extract filename */
-            while (*redirect_ptr && !char_is_space(*redirect_ptr)) {
-                filename[file_len] = *redirect_ptr;
-                file_len++;
-                redirect_ptr++;
-            }
-            filename[file_len] = '\0';
-            
-            if (file_len == 0) {
-                term_puts("Usage: echo <text> > <filename>", VGA_ATTR_MUTED);
-                return;
-            }
-            
-            if (!resolve_path(filename, fullpath)) {
-                term_puts("Path too long", VGA_ATTR_MUTED);
-                return;
-            }
-
-            if (dir_exists(fullpath)) {
-                term_puts("Cannot write, path is directory: ", VGA_ATTR_MUTED);
-                term_puts(fullpath, VGA_ATTR_MUTED);
-                return;
-            }
-
-            existed = file_exists_any(fullpath);
-            
-            if (!write_memory_file(fullpath, echo_text)) {
-                term_puts("Failed to write file (storage full)", VGA_ATTR_MUTED);
-                return;
-            }
-
-            if (existed)
-                term_puts("Updated: ", VGA_ATTR_TEXT);
-            else
-                term_puts("Created: ", VGA_ATTR_TEXT);
-            term_puts(fullpath, VGA_ATTR_TEXT);
+        if (parent_len == 0) {
+            parent_dir[0] = '/';
+            parent_dir[1] = '\0';
         } else {
-            /* Normal echo without redirection */
-            if (*args)
-                term_puts(args, VGA_ATTR_TEXT);
+            uint32_t j;
+            for (j = 0; j < parent_len; j++)
+                parent_dir[j] = file_path[j];
+            parent_dir[parent_len] = '\0';
         }
-        return;
+
+        if (str_eq(parent_dir, src_dir)) {
+            char dst_file[INPUT_MAX + 1];
+            const char *name = path_basename(file_path);
+
+            if (!path_build_join(dst_dir, name, dst_file))
+                return 0;
+            if (!copy_file_internal(file_path, dst_file))
+                return 0;
+        }
     }
 
-    term_puts("Unknown command: ", VGA_ATTR_MUTED);
-    term_puts(command_name, VGA_ATTR_MUTED);
+    i = 0;
+    while (fs_directories[i].name != 0) {
+        if (is_direct_child_path(src_dir, fs_directories[i].path)) {
+            char dst_subdir[INPUT_MAX + 1];
+
+            if (!path_build_join(dst_dir, fs_directories[i].name, dst_subdir))
+                return 0;
+            if (!copy_directory_tree(fs_directories[i].path, dst_subdir))
+                return 0;
+        }
+        i++;
+    }
+
+    for (i = 0; i < dir_count; i++) {
+        const char *mem_dir = directories[i];
+
+        if (is_direct_child_path(src_dir, mem_dir)) {
+            char dst_subdir[INPUT_MAX + 1];
+
+            if (!path_build_join(dst_dir, path_basename(mem_dir), dst_subdir))
+                return 0;
+            if (!copy_directory_tree(mem_dir, dst_subdir))
+                return 0;
+        }
+    }
+
+    return 1;
 }
 
-static void submit_input(void)
+void os_term_puts(const char *s, uint8_t attr)
 {
-    char command_line[INPUT_MAX + 1];
+    term_puts(s, attr);
+}
 
+void os_term_newline(void)
+{
+    term_newline();
+}
+
+void os_term_clear(void)
+{
     cursor_hide();
-    str_copy(command_line, input_buffer);
-    term_newline();
-    execute_command(command_line);
-    term_newline();
-    prompt_reset();
+    vga_clear();
+    draw_logo();
+    draw_ui();
+    term_prompt();
+}
+
+void os_redraw_input_line(void)
+{
     redraw_input_line();
 }
 
-static void input_insert_char(char ch)
+void os_cursor_hide(void)
 {
-    uint32_t index;
-
-    if (input_length >= INPUT_MAX)
-        return;
-
-    for (index = input_length; index > input_cursor; index--)
-        input_buffer[index] = input_buffer[index - 1];
-
-    input_buffer[input_cursor] = ch;
-    input_length++;
-    input_cursor++;
-    input_buffer[input_length] = '\0';
-    redraw_input_line();
+    cursor_hide();
 }
 
-static void input_backspace(void)
+void os_cursor_reset_blink(void)
 {
-    uint32_t index;
-
-    if (input_cursor == 0)
-        return;
-
-    for (index = input_cursor - 1; index < input_length - 1; index++)
-        input_buffer[index] = input_buffer[index + 1];
-
-    input_cursor--;
-    input_length--;
-    input_buffer[input_length] = '\0';
-    redraw_input_line();
-}
-
-static void input_move_left(void)
-{
-    if (input_cursor > 0)
-        input_cursor--;
-
     cursor_reset_blink();
 }
 
-static void input_move_right(void)
+int os_fs_resolve_path(const char *arg, char *out)
 {
-    if (input_cursor < input_length)
-        input_cursor++;
-
-    cursor_reset_blink();
+    return resolve_path(arg, out);
 }
 
-static void input_move_home(void)
+int os_fs_dir_exists(const char *path)
 {
-    input_cursor = 0;
-    cursor_reset_blink();
+    return dir_exists(path);
 }
 
-static void input_move_end(void)
+int os_fs_dir_is_builtin(const char *path)
 {
-    input_cursor = input_length;
-    cursor_reset_blink();
+    return dir_is_builtin(path);
 }
 
-static void input_tab(void)
+int os_fs_dir_has_entries(const char *path)
 {
-    uint32_t spaces = 4 - (input_cursor % 4);
-    uint32_t index;
+    return dir_has_entries(path);
+}
 
-    for (index = 0; index < spaces; index++) {
-        if (input_length >= INPUT_MAX)
-            break;
-        input_insert_char(' ');
+int os_fs_add_dir(const char *path)
+{
+    if (dir_exists(path))
+        return 0;
+
+    add_directory(path);
+    return dir_exists(path);
+}
+
+int os_fs_remove_dir(const char *path)
+{
+    return remove_memory_dir(path);
+}
+
+void os_fs_list_directory(const char *path)
+{
+    list_directory_internal(path, 0);
+}
+
+void os_fs_list_directory_sizes(const char *path)
+{
+    list_directory_internal(path, 1);
+}
+
+int os_fs_file_exists_any(const char *path)
+{
+    return file_exists_any(path);
+}
+
+int os_fs_file_exists_builtin(const char *path)
+{
+    return file_exists_builtin(path);
+}
+
+const char *os_fs_get_file_content(const char *path)
+{
+    return get_file_content_any(path);
+}
+
+int os_fs_write_file(const char *path, const char *content)
+{
+    return write_memory_file(path, content);
+}
+
+int os_fs_remove_file(const char *path)
+{
+    return remove_memory_file(path);
+}
+
+int os_fs_copy_file(const char *src, const char *dst)
+{
+    return copy_file_internal(src, dst);
+}
+
+int os_fs_move_file(const char *src, const char *dst)
+{
+    if (!copy_file_internal(src, dst))
+        return 0;
+
+    return remove_memory_file(src);
+}
+
+int os_fs_copy_dir(const char *src, const char *dst)
+{
+    if (!dir_exists(src))
+        return 0;
+
+    return copy_directory_tree(src, dst);
+}
+
+int os_fs_move_dir(const char *src, const char *dst)
+{
+    uint32_t i;
+    uint32_t src_len;
+
+    if (!dir_exists(src) || dir_is_builtin(src))
+        return 0;
+
+    if (path_is_under(src, dst))
+        return 0;
+
+    src_len = str_len(src);
+
+    for (i = 0; i < dir_count; i++) {
+        if (path_is_under(src, directories[i])) {
+            char new_path[INPUT_MAX + 1];
+            const char *suffix = &directories[i][src_len];
+
+            if (str_len(dst) + str_len(suffix) > INPUT_MAX)
+                return 0;
+
+            str_copy(new_path, dst);
+            str_copy(&new_path[str_len(dst)], suffix);
+            str_copy(directories[i], new_path);
+        }
     }
+
+    for (i = 0; i < file_count; i++) {
+        if (path_is_under(src, in_memory_files[i].path)) {
+            char new_path[INPUT_MAX + 1];
+            const char *suffix = &in_memory_files[i].path[src_len];
+
+            if (str_len(dst) + str_len(suffix) > INPUT_MAX)
+                return 0;
+
+            str_copy(new_path, dst);
+            str_copy(&new_path[str_len(dst)], suffix);
+            str_copy(in_memory_files[i].path, new_path);
+        }
+    }
+
+    return 1;
+}
+
+int os_game_launch(const char *path)
+{
+    return games_start_path(path);
+}
+
+void os_power_shutdown(void)
+{
+    /* QEMU ACPI power-off. */
+    outw(0x604, 0x2000);
+    outw(0xB004, 0x2000);
+
+    for (;;) {
+        __asm__ volatile ("cli; hlt");
+    }
+}
+
+void os_power_reboot(void)
+{
+    /* PS/2 controller reset pulse for CPU reboot. */
+    while (inb(PS2_STATUS_PORT) & 0x02)
+        ;
+    outb(0x64, 0xFE);
+
+    for (;;) {
+        __asm__ volatile ("cli; hlt");
+    }
+}
+
+const char *os_cpu_arch(void)
+{
+    if (cpu_x86_64_capable)
+        return "CPU: x86_64-capable (kernel mode: i386)";
+
+    return "CPU: i386-compatible";
 }
 
 static char alpha_with_case(char lower, int shift)
@@ -1625,6 +2174,7 @@ static char scancode_to_ascii(uint8_t scancode, int shift)
 static struct key_event keyboard_decode(uint8_t raw_scancode)
 {
     static int shift_down = 0;
+    static int ctrl_down = 0;
     static int extended = 0;
     struct key_event event;
     uint8_t released;
@@ -1646,6 +2196,11 @@ static struct key_event keyboard_decode(uint8_t raw_scancode)
 
     if (scancode == 0x2A || scancode == 0x36) {
         shift_down = released == 0;
+        return event;
+    }
+
+    if (scancode == 0x1D) {
+        ctrl_down = released == 0;
         return event;
     }
 
@@ -1678,6 +2233,14 @@ static struct key_event keyboard_decode(uint8_t raw_scancode)
 
     if (released)
         return event;
+
+    if (ctrl_down && scancode == 0x2E) {
+        event.type = KEY_CTRL_C;
+        event.code = 3;
+        event.has_code = 1;
+        event.label = "Ctrl+C";
+        return event;
+    }
 
     if (scancode == 0x3A) {
         caps_lock_enabled = !caps_lock_enabled;
@@ -1731,28 +2294,9 @@ static void keyboard_event_push(struct key_event event)
     kb_head = next;
 }
 
-static int keyboard_event_pop(struct key_event *event)
-{
-    int has_event = 0;
-    uint32_t flags;
-
-    __asm__ volatile ("pushf; pop %0" : "=r"(flags));
-    interrupts_disable();
-    if (kb_tail != kb_head) {
-        *event = kb_queue[kb_tail];
-        kb_tail = (kb_tail + 1) % KB_EVENT_QUEUE_SZ;
-        has_event = 1;
-    }
-    if (flags & (1u << 9))
-        interrupts_enable();
-
-    return has_event;
-}
-
 static struct key_event keyboard_poll_event(void)
 {
     struct key_event event;
-    uint8_t status;
 
     event.type = KEY_NONE;
     event.ch = 0;
@@ -1760,73 +2304,69 @@ static struct key_event keyboard_poll_event(void)
     event.has_code = 0;
     event.label = 0;
 
-    status = inb(PS2_STATUS_PORT);
-    if ((status & 0x01) == 0)
+    if (kb_tail == kb_head)
         return event;
 
-    return keyboard_decode(inb(PS2_DATA_PORT));
+    event = kb_queue[kb_tail];
+    kb_tail = (kb_tail + 1) % KB_EVENT_QUEUE_SZ;
+    return event;
 }
 
-void kernel_main(void)
+void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr)
 {
     struct key_event event;
+    int game_was_active = 0;
 
     interrupts_disable();
-    /* Keep advanced subsystems compiled but disabled until IRQ path is stabilized. */
     scheduler_init();
+    cpu_x86_64_capable = cpu_has_long_mode();
+    vga_init();
+    init_layout();
+    interrupts_init();
+    fat12_init_from_multiboot(multiboot_magic, multiboot_info_addr);
+    interrupts_enable();
 
     vga_clear();
-    boot_marker(0, "BOOT 1: kernel_main entered");
-    boot_marker(1, "BOOT 2: scheduler initialized");
-
     draw_logo();
-    boot_marker(2, "BOOT 3: logo drawn");
     draw_ui();
-    boot_marker(3, "BOOT 4: ui drawn");
     cursor_disable();
-    boot_marker(4, "BOOT 5: cursor disabled");
+    shell_init();
     term_prompt();
-    boot_marker(5, "BOOT 6: prompt ready");
     draw_status(&(struct key_event){ KEY_NONE, 0, 0, 0, "ready" });
-    boot_marker(6, "BOOT 7: entering main loop");
 
     for (;;) {
         event = keyboard_poll_event();
 
-        switch (event.type) {
-        case KEY_CHAR:
-            input_insert_char(event.ch);
-            break;
-        case KEY_ENTER:
-            submit_input();
-            break;
-        case KEY_BACKSPACE:
-            input_backspace();
-            break;
-        case KEY_TAB:
-            input_tab();
-            break;
-        case KEY_LEFT:
-            input_move_left();
-            break;
-        case KEY_RIGHT:
-            input_move_right();
-            break;
-        case KEY_UP:
-            input_move_home();
-            break;
-        case KEY_DOWN:
-            input_move_end();
-            break;
-        case KEY_CAPSLOCK:
-            break;
-        case KEY_NONE:
-        default:
-            cursor_tick();
+        if (event.type == KEY_NONE) {
+            if (games_is_active())
+                games_tick(scheduler_ticks);
+            else
+                cursor_tick();
+
+            if (game_was_active && !games_is_active()) {
+                os_redraw_input_line();
+                draw_status(&(struct key_event){ KEY_NONE, 0, 0, 0, "ready" });
+                game_was_active = 0;
+            }
+
             __asm__ volatile ("pause");
             continue;
         }
 
-        draw_status(&event);
+        if (games_is_active()) {
+            games_handle_event(&event);
+            if (!games_is_active()) {
+                os_redraw_input_line();
+                draw_status(&(struct key_event){ KEY_NONE, 0, 0, 0, "ready" });
+                game_was_active = 0;
+            }
+            continue;
+        }
+
+        shell_handle_event(&event);
+        if (games_is_active())
+            game_was_active = 1;
+        else
+            draw_status(&event);
     }
 }

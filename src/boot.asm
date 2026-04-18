@@ -43,11 +43,13 @@ _start:
     ; Clear direction flag, align stack
     cld
 
-    ; Very early breadcrumb: prove control reached our entry point.
-    mov dword [0xB8000], 0x0A530A42    ; 'B''S' with green attr bytes
+    ; Pass Multiboot2 magic/info (eax/ebx) to C entrypoint.
+    push ebx
+    push eax
 
-    ; Call kernel main — no arguments needed (VGA text mode address is fixed)
+    ; Call kernel main
     call kernel_main
+    add esp, 8
 
     ; Hang forever if kernel_main returns
 .hang:
