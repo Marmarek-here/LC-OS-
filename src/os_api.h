@@ -12,8 +12,10 @@ void os_term_clear(void);
 void os_redraw_input_line(void);
 void os_cursor_hide(void);
 void os_cursor_reset_blink(void);
+uint32_t os_term_cols(void);
 
 int os_fs_resolve_path(const char *arg, char *out);
+int os_fs_path_name_is_valid(const char *path);
 int os_fs_dir_exists(const char *path);
 int os_fs_dir_is_builtin(const char *path);
 int os_fs_dir_has_entries(const char *path);
@@ -21,6 +23,8 @@ int os_fs_add_dir(const char *path);
 int os_fs_remove_dir(const char *path);
 void os_fs_list_directory(const char *path);
 void os_fs_list_directory_sizes(const char *path);
+void os_fs_list_directory_rights(const char *path);
+void os_fs_list_directory_ex(const char *path, int show_sizes, int show_rights);
 
 int os_fs_file_exists_any(const char *path);
 int os_fs_file_exists_builtin(const char *path);

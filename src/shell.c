@@ -55,6 +55,23 @@ static int str_starts_with(const char *text, const char *prefix)
     return 1;
 }
 
+static int str_has_suffix(const char *text, const char *suffix)
+{
+    uint32_t tlen = str_len(text);
+    uint32_t slen = str_len(suffix);
+    uint32_t i;
+
+    if (tlen < slen)
+        return 0;
+
+    for (i = 0; i < slen; i++) {
+        if (text[tlen - slen + i] != suffix[i])
+            return 0;
+    }
+
+    return 1;
+}
+
 static void str_copy(char *dst, const char *src)
 {
     while (*src) {
@@ -204,17 +221,66 @@ static void shell_insert_tab(void)
 static void shell_print_help(void)
 {
     uint32_t count;
-    uint32_t index;
+    uint32_t i;
     const struct builtin_command *commands = builtin_commands_get(&count);
+    uint32_t cols = os_term_cols();
 
     os_term_puts("Built-in commands:", OS_ATTR_MUTED);
-    for (index = 0; index < count; index++) {
-        os_term_newline();
-        os_term_puts(commands[index].name, OS_ATTR_TEXT);
-        os_term_puts(" - ", OS_ATTR_TEXT);
-        os_term_puts(commands[index].help, OS_ATTR_TEXT);
+    os_term_newline();
+
+    if (cols < 96) {
+        /* Narrow terminals: one command per line to avoid wrap artifacts. */
+        for (i = 0; i < count; i++) {
+            os_term_puts(commands[i].name, OS_ATTR_TEXT);
+            os_term_puts(" : ", OS_ATTR_TEXT);
+            os_term_puts(commands[i].help, OS_ATTR_TEXT);
+            os_term_newline();
+        }
+        return;
     }
 
+    {
+        uint32_t half = (count + 1) / 2;
+        uint32_t left_width = (cols > 3) ? ((cols - 3) / 2) : cols;
+
+        for (i = 0; i < half; i++) {
+            char row_buf[INPUT_MAX + 1];
+            uint32_t pos = 0;
+            uint32_t j;
+            const char *lname = commands[i].name;
+            const char *lhelp = commands[i].help;
+
+            for (j = 0; lname[j] && pos < INPUT_MAX; j++)
+                row_buf[pos++] = lname[j];
+            if (pos < INPUT_MAX) row_buf[pos++] = ':';
+            if (pos < INPUT_MAX) row_buf[pos++] = ' ';
+            for (j = 0; lhelp[j] && pos < INPUT_MAX && pos < left_width; j++)
+                row_buf[pos++] = lhelp[j];
+
+            while (pos < left_width && pos < INPUT_MAX)
+                row_buf[pos++] = ' ';
+
+            if (pos < INPUT_MAX) row_buf[pos++] = ' ';
+            if (pos < INPUT_MAX) row_buf[pos++] = '|';
+            if (pos < INPUT_MAX) row_buf[pos++] = ' ';
+
+            if (i + half < count) {
+                const char *rname = commands[i + half].name;
+                const char *rhelp = commands[i + half].help;
+
+                for (j = 0; rname[j] && pos < INPUT_MAX; j++)
+                    row_buf[pos++] = rname[j];
+                if (pos < INPUT_MAX) row_buf[pos++] = ':';
+                if (pos < INPUT_MAX) row_buf[pos++] = ' ';
+                for (j = 0; rhelp[j] && pos < INPUT_MAX; j++)
+                    row_buf[pos++] = rhelp[j];
+            }
+
+            row_buf[pos] = '\0';
+            os_term_puts(row_buf, OS_ATTR_TEXT);
+            os_term_newline();
+        }
+    }
 }
 
 static void shell_execute(const char *input)
@@ -255,21 +321,79 @@ static void shell_execute(const char *input)
     }
 
     if (!builtin_commands_execute(command_name, args)) {
-        os_term_puts("Unknown command: ", OS_ATTR_MUTED);
-        os_term_puts(command_name, OS_ATTR_MUTED);
+        /* Try running as a file in the current directory.
+           Bare name ending in .lcbat  →  run <curdir>/<name>
+           ./name                      →  run <curdir>/<name>        */
+        char run_path[INPUT_MAX + 1];
+        const char *target = command_name;
+        int try_run = 0;
+
+        if (str_starts_with(target, "./")) {
+            target = target + 2;
+            try_run = 1;
+        } else if (str_has_suffix(target, ".lcbat")) {
+            try_run = 1;
+        }
+
+        if (try_run) {
+            const char *cur = shell_current_dir_buffer;
+            uint32_t cur_len = str_len(cur);
+            uint32_t t_len = str_len(target);
+            uint32_t pos = 0;
+            uint32_t k;
+
+            for (k = 0; k < cur_len && pos < INPUT_MAX; k++)
+                run_path[pos++] = cur[k];
+
+            if (pos > 0 && run_path[pos - 1] != '/' && pos < INPUT_MAX)
+                run_path[pos++] = '/';
+
+            for (k = 0; k < t_len && pos < INPUT_MAX; k++)
+                run_path[pos++] = target[k];
+
+            run_path[pos] = '\0';
+            builtin_commands_execute("run", run_path);
+        } else {
+            os_term_puts("Unknown command: ", OS_ATTR_MUTED);
+            os_term_puts(command_name, OS_ATTR_MUTED);
+        }
     }
 }
 
 static void shell_submit(void)
 {
     char command_line[INPUT_MAX + 1];
+    char segment[INPUT_MAX + 1];
+    uint32_t seg_len = 0;
+    uint32_t i = 0;
 
     os_cursor_hide();
     str_copy(command_line, shell_input_buffer);
     shell_history_add(command_line);
     shell_history_view = -1;
     os_term_newline();
-    shell_execute(command_line);
+
+    /* Split on && and execute each segment in order */
+    while (command_line[i]) {
+        if (command_line[i] == '&' && command_line[i + 1] == '&') {
+            segment[seg_len] = '\0';
+            shell_execute(segment);
+            os_term_newline();
+            seg_len = 0;
+            i += 2;
+            /* Skip whitespace after && */
+            while (command_line[i] == ' ' || command_line[i] == '\t')
+                i++;
+        } else {
+            if (seg_len < INPUT_MAX)
+                segment[seg_len++] = command_line[i];
+            i++;
+        }
+    }
+    /* Execute final (or only) segment */
+    segment[seg_len] = '\0';
+    shell_execute(segment);
+
     os_term_newline();
     shell_input_reset();
     os_redraw_input_line();

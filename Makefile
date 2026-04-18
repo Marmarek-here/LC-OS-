@@ -52,7 +52,7 @@ ISO_IMG    := lcos.iso
 FS_HEADER   := $(BUILD)/filesystem_entries.h
 FS_DATA_HEADER := $(BUILD)/filesystem_data.h
 
-OBJS := $(BUILD)/boot.o $(BUILD)/interrupts.o $(BUILD)/kernel.o $(BUILD)/shell.o $(BUILD)/builtin_commands.o $(BUILD)/vga.o $(BUILD)/games.o
+OBJS := $(BUILD)/boot.o $(BUILD)/interrupts.o $(BUILD)/kernel.o $(BUILD)/shell.o $(BUILD)/builtin_commands.o $(BUILD)/vga.o $(BUILD)/games.o $(BUILD)/reboot_state.o
 
 # ─────────────────────────────────────────────────────────────────────────────
 .PHONY: all iso run run-i386 run-x86_64 clean
@@ -79,6 +79,9 @@ $(BUILD)/vga.o: $(SRC_DIR)/vga.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/games.o: $(SRC_DIR)/games.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/reboot_state.o: $(SRC_DIR)/reboot_state.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(FS_HEADER): $(FS_TREE) | $(BUILD)

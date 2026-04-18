@@ -7,6 +7,7 @@
 #include "commands/builtin_commands.h"
 #include "games.h"
 #include "os_api.h"
+#include "reboot_state.h"
 #include "shell.h"
 #include "types.h"
 #include "vga.h"
@@ -1450,6 +1451,27 @@ static int str_starts_with(const char *text, const char *prefix)
     return 1;
 }
 
+static int path_has_forbidden_name_chars(const char *path)
+{
+    uint32_t i = 0;
+
+    while (path[i]) {
+        char c = path[i];
+
+        if (c != '/') {
+            if (c == ' ' || c == '"' || c == '\'' || c == '\\' ||
+                c == '(' || c == ')' || c == '{' || c == '}' ||
+                c == '[' || c == ']') {
+                return 1;
+            }
+        }
+
+        i++;
+    }
+
+    return 0;
+}
+
 static int resolve_path(const char *arg, char *out)
 {
     uint32_t arg_len = str_len(arg);
@@ -1665,7 +1687,7 @@ static void print_file_with_size(const char *name, uint32_t size, int show_sizes
         term_puts(size_dec, VGA_ATTR_MUTED);
         term_puts(" B)", VGA_ATTR_MUTED);
     }
-    term_newline();
+    /* Caller is responsible for term_newline() so suffixes (rights) can follow */
 }
 
 static uint32_t path_parent_length(const char *path)
@@ -1740,56 +1762,128 @@ static const char *get_file_content_any(const char *path)
 }
 
 /* List files and subdirectories in a given directory */
-static void list_directory_internal(const char *dirpath, int show_sizes)
+#define LS_MAX_DIRS  128
+#define LS_MAX_FILES 256
+#define LS_NAME_MAX  64
+
+struct ls_entry {
+    char name[LS_NAME_MAX];
+    uint32_t size;
+    int writable;
+    int executable;
+};
+
+static void ls_str_copy_truncate(char *dst, const char *src, uint32_t max)
+{
+    uint32_t i = 0;
+    while (src[i] && i < max - 1) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+static int ls_str_cmp(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char ca = *a >= 'A' && *a <= 'Z' ? (char)(*a + 32) : *a;
+        char cb = *b >= 'B' && *b <= 'Z' ? (char)(*b + 32) : *b;
+        if (ca < cb) return -1;
+        if (ca > cb) return 1;
+        a++;
+        b++;
+    }
+    if (!*a && !*b) return 0;
+    return *a ? 1 : -1;
+}
+
+static void ls_sort(struct ls_entry *arr, uint32_t count)
 {
     uint32_t i, j;
-    int found_any = 0;
+    struct ls_entry tmp;
+    for (i = 1; i < count; i++) {
+        tmp = arr[i];
+        j = i;
+        while (j > 0 && ls_str_cmp(arr[j - 1].name, tmp.name) > 0) {
+            arr[j] = arr[j - 1];
+            j--;
+        }
+        arr[j] = tmp;
+    }
+}
 
+static int ls_name_has_suffix(const char *name, const char *suffix)
+{
+    uint32_t nlen = 0, slen = 0, i;
+    while (name[nlen]) nlen++;
+    while (suffix[slen]) slen++;
+    if (nlen < slen) return 0;
+    for (i = 0; i < slen; i++) {
+        if (name[nlen - slen + i] != suffix[i]) return 0;
+    }
+    return 1;
+}
+
+static int ls_is_executable(const char *name)
+{
+    return ls_name_has_suffix(name, ".lcbat") ||
+           ls_name_has_suffix(name, "snake") ||
+           ls_name_has_suffix(name, "tetris") ||
+           ls_name_has_suffix(name, "pingpong");
+}
+
+static void list_directory_internal(const char *dirpath, int show_sizes, int show_rights)
+{
+    static struct ls_entry dir_entries[LS_MAX_DIRS];
+    static struct ls_entry file_entries[LS_MAX_FILES];
+    uint32_t dir_count_l = 0, file_count_l = 0;
+    uint32_t i, j;
+
+    /* Collect built-in subdirectories */
     i = 0;
     while (fs_directories[i].name != 0) {
-        const char *subdir_path = fs_directories[i].path;
-
-        if (is_direct_child_path(dirpath, subdir_path)) {
-            term_puts(fs_directories[i].name, VGA_ATTR_DIR);
-            if (show_sizes)
-                term_puts(" (<DIR>)", VGA_ATTR_MUTED);
-            term_newline();
-            found_any = 1;
-        }
-
-        i++;
-    }
-
-    i = 0;
-    while (fs_files[i].name != 0) {
-        if (str_eq(fs_files[i].dir_path, dirpath) && find_memory_file(fs_files[i].path) == 0) {
-            print_file_with_size(fs_files[i].name, text_len(fs_files[i].content), show_sizes);
-            found_any = 1;
+        if (is_direct_child_path(dirpath, fs_directories[i].path) && dir_count_l < LS_MAX_DIRS) {
+            ls_str_copy_truncate(dir_entries[dir_count_l].name, fs_directories[i].name, LS_NAME_MAX);
+            dir_entries[dir_count_l].size = 0;
+            dir_entries[dir_count_l].writable = 0;
+            dir_entries[dir_count_l].executable = 0;
+            dir_count_l++;
         }
         i++;
     }
 
+    /* Collect in-memory subdirectories */
     for (i = 0; i < dir_count; i++) {
         const char *mem_dir = directories[i];
-
-        if (is_direct_child_path(dirpath, mem_dir)) {
+        if (is_direct_child_path(dirpath, mem_dir) && dir_count_l < LS_MAX_DIRS) {
             uint32_t start = 1;
-
             if (!str_eq(dirpath, "/")) {
                 uint32_t len = 0;
-                while (dirpath[len])
-                    len++;
+                while (dirpath[len]) len++;
                 start = len + 1;
             }
-
-            term_puts(&mem_dir[start], VGA_ATTR_DIR);
-            if (show_sizes)
-                term_puts(" (<DIR>)", VGA_ATTR_MUTED);
-            term_newline();
-            found_any = 1;
+            ls_str_copy_truncate(dir_entries[dir_count_l].name, &mem_dir[start], LS_NAME_MAX);
+            dir_entries[dir_count_l].size = 0;
+            dir_entries[dir_count_l].writable = 1;
+            dir_entries[dir_count_l].executable = 0;
+            dir_count_l++;
         }
     }
 
+    /* Collect built-in files (not shadowed by in-memory) */
+    i = 0;
+    while (fs_files[i].name != 0) {
+        if (str_eq(fs_files[i].dir_path, dirpath) && find_memory_file(fs_files[i].path) == 0 && file_count_l < LS_MAX_FILES) {
+            ls_str_copy_truncate(file_entries[file_count_l].name, fs_files[i].name, LS_NAME_MAX);
+            file_entries[file_count_l].size = text_len(fs_files[i].content);
+            file_entries[file_count_l].writable = 0;
+            file_entries[file_count_l].executable = ls_is_executable(fs_files[i].name);
+            file_count_l++;
+        }
+        i++;
+    }
+
+    /* Collect in-memory files */
     for (i = 0; i < file_count; i++) {
         const char *file_path = in_memory_files[i].path;
         uint32_t parent_len = path_parent_length(file_path);
@@ -1804,15 +1898,53 @@ static void list_directory_internal(const char *dirpath, int show_sizes)
             parent_dir[parent_len] = '\0';
         }
 
-        if (str_eq(parent_dir, dirpath)) {
-            const char *filename = &file_path[parent_len + 1];
-            print_file_with_size(filename, in_memory_files[i].content_len, show_sizes);
-            found_any = 1;
+        if (str_eq(parent_dir, dirpath) && file_count_l < LS_MAX_FILES) {
+            const char *fname = &file_path[parent_len + 1];
+            ls_str_copy_truncate(file_entries[file_count_l].name, fname, LS_NAME_MAX);
+            file_entries[file_count_l].size = in_memory_files[i].content_len;
+            file_entries[file_count_l].writable = 1;
+            file_entries[file_count_l].executable = ls_is_executable(fname);
+            file_count_l++;
         }
     }
 
-    if (!found_any)
+    if (dir_count_l == 0 && file_count_l == 0) {
         term_puts("<empty>", VGA_ATTR_MUTED);
+        return;
+    }
+
+    /* Sort each group A-Z */
+    ls_sort(dir_entries, dir_count_l);
+    ls_sort(file_entries, file_count_l);
+
+    /* Print dirs */
+    for (i = 0; i < dir_count_l; i++) {
+        term_puts(dir_entries[i].name, VGA_ATTR_DIR);
+        if (show_sizes)
+            term_puts(" (<DIR>)", VGA_ATTR_MUTED);
+        if (show_rights) {
+            const char *perm = dir_entries[i].writable ? "  [drw-]" : "  [dr--]";
+            term_puts(perm, VGA_ATTR_MUTED);
+        }
+        term_newline();
+    }
+
+    /* Print files */
+    for (i = 0; i < file_count_l; i++) {
+        print_file_with_size(file_entries[i].name, file_entries[i].size, show_sizes);
+        if (show_rights) {
+            char perm[10];
+            /* Format: [-rw-] — always readable, writable if in-memory, executable if .lcbat/game */
+            perm[0] = ' '; perm[1] = ' '; perm[2] = '[';
+            perm[3] = '-';
+            perm[4] = 'r';
+            perm[5] = file_entries[i].writable   ? 'w' : '-';
+            perm[6] = file_entries[i].executable ? 'x' : '-';
+            perm[7] = ']'; perm[8] = '\0';
+            term_puts(perm, VGA_ATTR_MUTED);
+        }
+        term_newline();
+    }
 }
 
 static int copy_file_internal(const char *src, const char *dst)
@@ -1936,6 +2068,11 @@ void os_cursor_reset_blink(void)
     cursor_reset_blink();
 }
 
+uint32_t os_term_cols(void)
+{
+    return term_cols();
+}
+
 int os_fs_resolve_path(const char *arg, char *out)
 {
     return resolve_path(arg, out);
@@ -1958,6 +2095,9 @@ int os_fs_dir_has_entries(const char *path)
 
 int os_fs_add_dir(const char *path)
 {
+    if (path_has_forbidden_name_chars(path))
+        return 0;
+
     if (dir_exists(path))
         return 0;
 
@@ -1972,12 +2112,22 @@ int os_fs_remove_dir(const char *path)
 
 void os_fs_list_directory(const char *path)
 {
-    list_directory_internal(path, 0);
+    list_directory_internal(path, 0, 0);
 }
 
 void os_fs_list_directory_sizes(const char *path)
 {
-    list_directory_internal(path, 1);
+    list_directory_internal(path, 1, 0);
+}
+
+void os_fs_list_directory_rights(const char *path)
+{
+    list_directory_internal(path, 0, 1);
+}
+
+void os_fs_list_directory_ex(const char *path, int show_sizes, int show_rights)
+{
+    list_directory_internal(path, show_sizes, show_rights);
 }
 
 int os_fs_file_exists_any(const char *path)
@@ -1997,6 +2147,9 @@ const char *os_fs_get_file_content(const char *path)
 
 int os_fs_write_file(const char *path, const char *content)
 {
+    if (path_has_forbidden_name_chars(path))
+        return 0;
+
     return write_memory_file(path, content);
 }
 
@@ -2007,11 +2160,17 @@ int os_fs_remove_file(const char *path)
 
 int os_fs_copy_file(const char *src, const char *dst)
 {
+    if (path_has_forbidden_name_chars(dst))
+        return 0;
+
     return copy_file_internal(src, dst);
 }
 
 int os_fs_move_file(const char *src, const char *dst)
 {
+    if (path_has_forbidden_name_chars(dst))
+        return 0;
+
     if (!copy_file_internal(src, dst))
         return 0;
 
@@ -2020,6 +2179,9 @@ int os_fs_move_file(const char *src, const char *dst)
 
 int os_fs_copy_dir(const char *src, const char *dst)
 {
+    if (path_has_forbidden_name_chars(dst))
+        return 0;
+
     if (!dir_exists(src))
         return 0;
 
@@ -2032,6 +2194,9 @@ int os_fs_move_dir(const char *src, const char *dst)
     uint32_t src_len;
 
     if (!dir_exists(src) || dir_is_builtin(src))
+        return 0;
+
+    if (path_has_forbidden_name_chars(dst))
         return 0;
 
     if (path_is_under(src, dst))
@@ -2070,6 +2235,11 @@ int os_fs_move_dir(const char *src, const char *dst)
     return 1;
 }
 
+int os_fs_path_name_is_valid(const char *path)
+{
+    return !path_has_forbidden_name_chars(path);
+}
+
 int os_game_launch(const char *path)
 {
     return games_start_path(path);
@@ -2088,14 +2258,7 @@ void os_power_shutdown(void)
 
 void os_power_reboot(void)
 {
-    /* PS/2 controller reset pulse for CPU reboot. */
-    while (inb(PS2_STATUS_PORT) & 0x02)
-        ;
-    outb(0x64, 0xFE);
-
-    for (;;) {
-        __asm__ volatile ("cli; hlt");
-    }
+    reboot_request();
 }
 
 const char *os_cpu_arch(void)
@@ -2335,6 +2498,17 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr)
     draw_status(&(struct key_event){ KEY_NONE, 0, 0, 0, "ready" });
 
     for (;;) {
+        if (reboot_take_requested()) {
+            vga_clear();
+            draw_logo();
+            draw_ui();
+            cursor_disable();
+            shell_init();
+            term_prompt();
+            draw_status(&(struct key_event){ KEY_NONE, 0, 0, 0, "ready" });
+            game_was_active = 0;
+        }
+
         event = keyboard_poll_event();
 
         if (event.type == KEY_NONE) {
