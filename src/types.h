@@ -11,6 +11,8 @@ enum key_type {
     KEY_NONE = 0,
     KEY_CHAR,
     KEY_CTRL_C,
+    KEY_CTRL_S,
+    KEY_CTRL_E,
     KEY_ENTER,
     KEY_BACKSPACE,
     KEY_TAB,

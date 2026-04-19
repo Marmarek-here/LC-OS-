@@ -42,6 +42,7 @@ BUILD    := build
 ISO_DIR  := iso
 FS_DIR   := ../fs
 FS_IMAGE := $(BUILD)/fs.img
+FS_STAGE := $(BUILD)/fs_stage
 FS_TREE := $(shell find $(FS_DIR) -mindepth 1 | sort)
 FS_FILES := $(shell find $(FS_DIR) -mindepth 1 -type f | sort)
 
@@ -52,7 +53,7 @@ ISO_IMG    := lcos.iso
 FS_HEADER   := $(BUILD)/filesystem_entries.h
 FS_DATA_HEADER := $(BUILD)/filesystem_data.h
 
-OBJS := $(BUILD)/boot.o $(BUILD)/interrupts.o $(BUILD)/kernel.o $(BUILD)/shell.o $(BUILD)/builtin_commands.o $(BUILD)/vga.o $(BUILD)/games.o $(BUILD)/reboot_state.o
+OBJS := $(BUILD)/boot.o $(BUILD)/interrupts.o $(BUILD)/kernel.o $(BUILD)/shell.o $(BUILD)/builtin_commands.o $(BUILD)/vga.o $(BUILD)/games.o $(BUILD)/reboot_state.o $(BUILD)/program_registry.o $(BUILD)/program_snake.o $(BUILD)/program_tetris.o $(BUILD)/program_pingpong.o
 
 # ─────────────────────────────────────────────────────────────────────────────
 .PHONY: all iso run run-i386 run-x86_64 clean
@@ -82,6 +83,18 @@ $(BUILD)/games.o: $(SRC_DIR)/games.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/reboot_state.o: $(SRC_DIR)/reboot_state.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/program_registry.o: $(SRC_DIR)/programs/program_registry.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/program_snake.o: $(SRC_DIR)/programs/snake.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/program_tetris.o: $(SRC_DIR)/programs/tetris.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/program_pingpong.o: $(SRC_DIR)/programs/pingpong.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(FS_HEADER): $(FS_TREE) | $(BUILD)
@@ -137,8 +150,11 @@ $(FS_DATA_HEADER): $(FS_FILES) | $(BUILD)
 
 $(FS_IMAGE): $(FS_TREE) | $(BUILD)
 	rm -f $@
+	rm -rf $(FS_STAGE)
+	mkdir -p $(FS_STAGE)
+	if [ -d $(FS_DIR) ]; then cp -a $(FS_DIR)/. $(FS_STAGE)/; fi
 	mformat -i $@ -f 1440 -C ::
-	mcopy -i $@ -s $(FS_DIR)/* ::
+	mcopy -i $@ -s $(FS_STAGE)/* ::
 
 # ── Link ──────────────────────────────────────────────────────────────────────
 $(KERNEL_ELF): $(OBJS)
@@ -158,26 +174,32 @@ run: $(ISO_IMG)
 
 run-x86_64: $(ISO_IMG)
 	qemu-system-x86_64 \
+	    -boot order=dc \
 	    -cdrom $(ISO_IMG) \
+	    -drive file=$(FS_IMAGE),format=raw,if=ide,index=0,media=disk \
 	    -m 128M \
 	    -vga std \
-	    -display gtk,zoom-to-fit=on,full-screen=on \
+	    -display gtk,zoom-to-fit=off,gl=off \
 	    -no-reboot \
 	    -no-shutdown
 
 run-i386: $(ISO_IMG)
 	qemu-system-i386 \
+	    -boot order=dc \
 	    -cdrom $(ISO_IMG) \
+	    -drive file=$(FS_IMAGE),format=raw,if=ide,index=0,media=disk \
 	    -m 128M \
 	    -vga std \
-	    -display gtk,zoom-to-fit=on,full-screen=on \
+	    -display gtk,zoom-to-fit=off,gl=off \
 	    -no-reboot \
 	    -no-shutdown
 
 # ── Run headless (for CI / SSH sessions) ─────────────────────────────────────
 run-nographic: $(ISO_IMG)
 	qemu-system-x86_64 \
+	    -boot order=dc \
 	    -cdrom $(ISO_IMG) \
+	    -drive file=$(FS_IMAGE),format=raw,if=ide,index=0,media=disk \
 	    -m 128M \
 	    -display none \
 	    -vga std \

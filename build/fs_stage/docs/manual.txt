@@ -1,0 +1,2 @@
+LC(OS) User Manual
+This is a simple 32-bit kernel with VGA terminal support.

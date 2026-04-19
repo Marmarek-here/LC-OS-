@@ -7,6 +7,7 @@
 #include "commands/builtin_commands.h"
 #include "games.h"
 #include "os_api.h"
+#include "programs/program_registry.h"
 #include "reboot_state.h"
 #include "shell.h"
 #include "types.h"
@@ -23,16 +24,15 @@
 #define VGA_ATTR_FILE      0x0B
 #define PROMPT_SIZE        2
 #define CURSOR_BLINK_DELAY 3000000
-
 #define PS2_DATA_PORT      0x60
 #define PS2_STATUS_PORT    0x64
 #define CMOS_INDEX_PORT    0x70
 #define CMOS_DATA_PORT     0x71
 
 #define MULTIBOOT2_BOOTLOADER_MAGIC 0x36D76289
-
-#define MULTIBOOT2_TAG_TYPE_END     0
-#define MULTIBOOT2_TAG_TYPE_MODULE  3
+#define MULTIBOOT2_TAG_TYPE_END          0
+#define MULTIBOOT2_TAG_TYPE_MODULE        3
+#define MULTIBOOT2_TAG_TYPE_FRAMEBUFFER   8
 
 #define VGA_CRTC_INDEX     0x3D4
 #define VGA_CRTC_DATA      0x3D5
@@ -70,6 +70,35 @@ struct InMemFile {
 static struct InMemFile in_memory_files[MAX_FILES];
 static uint32_t file_count = 0;
 
+#define FS_PERSIST_MAGIC0  'L'
+#define FS_PERSIST_MAGIC1  'C'
+#define FS_PERSIST_MAGIC2  'O'
+#define FS_PERSIST_MAGIC3  'S'
+#define FS_PERSIST_MAGIC4  'P'
+#define FS_PERSIST_MAGIC5  'F'
+#define FS_PERSIST_MAGIC6  'S'
+#define FS_PERSIST_MAGIC7  '1'
+#define FS_PERSIST_VERSION 1u
+#define FS_PERSIST_SECTORS 96u
+
+struct persist_file_entry {
+    char path[INPUT_MAX + 1];
+    uint32_t content_len;
+    char content[256];
+};
+
+struct persist_state {
+    uint8_t magic[8];
+    uint32_t version;
+    uint32_t dir_count;
+    uint32_t file_count;
+    char directories[MAX_DIRS][INPUT_MAX + 1];
+    struct persist_file_entry files[MAX_FILES];
+};
+
+static int fs_persist_enabled = 0;
+static int fs_persist_ready = 0;
+
 #define IDT_ENTRIES        256
 #define PIC1_CMD           0x20
 #define PIC1_DATA          0x21
@@ -85,6 +114,10 @@ static volatile uint32_t kb_tail = 0;
 static volatile uint32_t scheduler_ticks = 0;
 static volatile uint32_t scheduler_current_task = 0;
 static volatile uint32_t scheduler_task_count = 1;
+static char pipe_input_buffer[2048];
+static int term_capture_active = 0;
+static char term_capture_buffer[4096];
+static uint32_t term_capture_len = 0;
 
 static uint32_t page_directory[1024] __attribute__((aligned(4096)));
 static uint32_t first_page_table[1024] __attribute__((aligned(4096)));
@@ -113,6 +146,19 @@ struct multiboot2_tag_module {
     uint32_t mod_start;
     uint32_t mod_end;
     char cmdline[1];
+} __attribute__((packed));
+
+struct multiboot2_tag_framebuffer {
+    uint32_t type;
+    uint32_t size;
+    uint32_t framebuffer_addr_lo;
+    uint32_t framebuffer_addr_hi;
+    uint32_t framebuffer_pitch;
+    uint32_t framebuffer_width;
+    uint32_t framebuffer_height;
+    uint8_t  framebuffer_bpp;
+    uint8_t  framebuffer_type; /* 1 = RGB, 2 = EGA text */
+    uint16_t reserved;
 } __attribute__((packed));
 
 struct fat12_context {
@@ -144,15 +190,25 @@ extern void irq1_stub(void);
 
 static struct key_event keyboard_decode(uint8_t raw_scancode);
 static void keyboard_event_push(struct key_event event);
+static struct key_event keyboard_poll_event(void);
 static const char *fat12_get_file_content(const char *path);
 static void cursor_disable(void);
 static void u32_to_hex(uint32_t value, char *buffer);
+static uint32_t str_len(const char *s);
+static void str_copy(char *dst, const char *src);
+static void u32_to_dec(uint32_t value, char *buffer);
 
 static inline uint8_t inb(uint16_t port)
 {
     uint8_t value;
-
     __asm__ volatile ("inb %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
+
+static inline uint16_t inw(uint16_t port)
+{
+    uint16_t value;
+    __asm__ volatile ("inw %1, %0" : "=a"(value) : "Nd"(port));
     return value;
 }
 
@@ -166,9 +222,318 @@ static inline void outw(uint16_t port, uint16_t value)
     __asm__ volatile ("outw %0, %1" : : "a"(value), "Nd"(port));
 }
 
+static inline uint32_t inl(uint16_t port)
+{
+    uint32_t value;
+    __asm__ volatile ("inl %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
+
+static inline void outl(uint16_t port, uint32_t value)
+{
+    __asm__ volatile ("outl %0, %1" : : "a"(value), "Nd"(port));
+}
+
 static inline void io_wait(void)
 {
     __asm__ volatile ("outb %%al, $0x80" : : "a"(0));
+}
+
+static int ata_wait_not_busy(uint16_t io_base)
+{
+    uint32_t timeout = 1000000u;
+    while (timeout--) {
+        uint8_t status = inb((uint16_t)(io_base + 7));
+        if ((status & 0x80u) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int ata_wait_drq(uint16_t io_base)
+{
+    uint32_t timeout = 1000000u;
+    while (timeout--) {
+        uint8_t status = inb((uint16_t)(io_base + 7));
+        if (status & 0x01u)
+            return 0;
+        if ((status & 0x80u) == 0 && (status & 0x08u))
+            return 1;
+    }
+    return 0;
+}
+
+static int ata_pio_read_sector(uint32_t lba, uint8_t *out)
+{
+    uint16_t io = 0x1F0;
+    uint32_t i;
+
+    if (lba >= 0x10000000u)
+        return 0;
+
+    if (!ata_wait_not_busy(io))
+        return 0;
+
+    outb((uint16_t)(io + 6), (uint8_t)(0xE0u | ((lba >> 24) & 0x0Fu)));
+    outb((uint16_t)(io + 2), 1u);
+    outb((uint16_t)(io + 3), (uint8_t)(lba & 0xFFu));
+    outb((uint16_t)(io + 4), (uint8_t)((lba >> 8) & 0xFFu));
+    outb((uint16_t)(io + 5), (uint8_t)((lba >> 16) & 0xFFu));
+    outb((uint16_t)(io + 7), 0x20u);
+
+    if (!ata_wait_drq(io))
+        return 0;
+
+    for (i = 0; i < 256u; i++) {
+        uint16_t w = inw(io);
+        out[i * 2u] = (uint8_t)(w & 0xFFu);
+        out[i * 2u + 1u] = (uint8_t)((w >> 8) & 0xFFu);
+    }
+
+    return 1;
+}
+
+static int ata_pio_write_sector(uint32_t lba, const uint8_t *in)
+{
+    uint16_t io = 0x1F0;
+    uint32_t i;
+
+    if (lba >= 0x10000000u)
+        return 0;
+
+    if (!ata_wait_not_busy(io))
+        return 0;
+
+    outb((uint16_t)(io + 6), (uint8_t)(0xE0u | ((lba >> 24) & 0x0Fu)));
+    outb((uint16_t)(io + 2), 1u);
+    outb((uint16_t)(io + 3), (uint8_t)(lba & 0xFFu));
+    outb((uint16_t)(io + 4), (uint8_t)((lba >> 8) & 0xFFu));
+    outb((uint16_t)(io + 5), (uint8_t)((lba >> 16) & 0xFFu));
+    outb((uint16_t)(io + 7), 0x30u);
+
+    if (!ata_wait_drq(io))
+        return 0;
+
+    for (i = 0; i < 256u; i++) {
+        uint16_t w = (uint16_t)in[i * 2u] | (uint16_t)(in[i * 2u + 1u] << 8);
+        outw(io, w);
+    }
+
+    outb((uint16_t)(io + 7), 0xE7u);
+    if (!ata_wait_not_busy(io))
+        return 0;
+
+    return 1;
+}
+
+static int ata_identify_total_sectors(uint32_t *total)
+{
+    uint16_t io = 0x1F0;
+    uint16_t words[256];
+    uint32_t i;
+    uint8_t status;
+
+    outb((uint16_t)(io + 6), 0xA0u);
+    outb((uint16_t)(io + 2), 0u);
+    outb((uint16_t)(io + 3), 0u);
+    outb((uint16_t)(io + 4), 0u);
+    outb((uint16_t)(io + 5), 0u);
+    outb((uint16_t)(io + 7), 0xECu);
+
+    status = inb((uint16_t)(io + 7));
+    if (status == 0u || status == 0xFFu)
+        return 0;
+
+    if (!ata_wait_drq(io))
+        return 0;
+
+    for (i = 0; i < 256u; i++)
+        words[i] = inw(io);
+
+    *total = ((uint32_t)words[61] << 16) | (uint32_t)words[60];
+    if (*total == 0u)
+        return 0;
+
+    return 1;
+}
+
+static int fs_persist_magic_ok(const uint8_t *m)
+{
+    return m[0] == FS_PERSIST_MAGIC0 && m[1] == FS_PERSIST_MAGIC1 &&
+           m[2] == FS_PERSIST_MAGIC2 && m[3] == FS_PERSIST_MAGIC3 &&
+           m[4] == FS_PERSIST_MAGIC4 && m[5] == FS_PERSIST_MAGIC5 &&
+           m[6] == FS_PERSIST_MAGIC6 && m[7] == FS_PERSIST_MAGIC7;
+}
+
+static int fs_persist_region_is_zero(const uint8_t *blk)
+{
+    uint32_t i;
+    for (i = 0; i < 512u; i++) {
+        if (blk[i] != 0u)
+            return 0;
+    }
+    return 1;
+}
+
+static int fs_persist_read_state(struct persist_state *state)
+{
+    uint32_t total;
+    uint32_t start_lba;
+    uint32_t i;
+    uint8_t *dst = (uint8_t *)state;
+    uint8_t first[512];
+    uint32_t need;
+
+    if (!ata_identify_total_sectors(&total))
+        return 0;
+    if (total <= FS_PERSIST_SECTORS)
+        return 0;
+
+    start_lba = total - FS_PERSIST_SECTORS;
+    if (!ata_pio_read_sector(start_lba, first))
+        return 0;
+
+    if (!fs_persist_magic_ok(first)) {
+        if (!fs_persist_region_is_zero(first))
+            return 0;
+        fs_persist_enabled = 1;
+        return 1;
+    }
+
+    need = (uint32_t)sizeof(struct persist_state);
+    for (i = 0; i < FS_PERSIST_SECTORS && need > 0u; i++) {
+        uint8_t blk[512];
+        uint32_t copy = need > 512u ? 512u : need;
+        uint32_t j;
+
+        if (!ata_pio_read_sector(start_lba + i, blk))
+            return 0;
+        for (j = 0; j < copy; j++)
+            dst[i * 512u + j] = blk[j];
+        need -= copy;
+    }
+
+    if (!fs_persist_magic_ok(state->magic) || state->version != FS_PERSIST_VERSION)
+        return 0;
+
+    fs_persist_enabled = 1;
+    return 1;
+}
+
+static int fs_persist_write_state(const struct persist_state *state)
+{
+    uint32_t total;
+    uint32_t start_lba;
+    uint32_t i;
+    const uint8_t *src = (const uint8_t *)state;
+    uint32_t need;
+
+    if (!fs_persist_enabled)
+        return 0;
+
+    if (!ata_identify_total_sectors(&total))
+        return 0;
+    if (total <= FS_PERSIST_SECTORS)
+        return 0;
+
+    start_lba = total - FS_PERSIST_SECTORS;
+    need = (uint32_t)sizeof(struct persist_state);
+
+    for (i = 0; i < FS_PERSIST_SECTORS; i++) {
+        uint8_t blk[512];
+        uint32_t copy = need > 512u ? 512u : need;
+        uint32_t j;
+
+        for (j = 0; j < 512u; j++)
+            blk[j] = 0u;
+
+        if (copy > 0u) {
+            for (j = 0; j < copy; j++)
+                blk[j] = src[i * 512u + j];
+            need -= copy;
+        }
+
+        if (!ata_pio_write_sector(start_lba + i, blk))
+            return 0;
+    }
+
+    return 1;
+}
+
+static void fs_persist_save_current(void)
+{
+    struct persist_state state;
+    uint32_t i;
+    uint32_t j;
+
+    if (fs_persist_ready == 0)
+        return;
+
+    for (i = 0; i < sizeof(struct persist_state); i++)
+        ((uint8_t *)&state)[i] = 0u;
+
+    state.magic[0] = FS_PERSIST_MAGIC0;
+    state.magic[1] = FS_PERSIST_MAGIC1;
+    state.magic[2] = FS_PERSIST_MAGIC2;
+    state.magic[3] = FS_PERSIST_MAGIC3;
+    state.magic[4] = FS_PERSIST_MAGIC4;
+    state.magic[5] = FS_PERSIST_MAGIC5;
+    state.magic[6] = FS_PERSIST_MAGIC6;
+    state.magic[7] = FS_PERSIST_MAGIC7;
+    state.version = FS_PERSIST_VERSION;
+    state.dir_count = dir_count;
+    state.file_count = file_count;
+
+    for (i = 0; i < dir_count && i < MAX_DIRS; i++) {
+        for (j = 0; directories[i][j] && j < INPUT_MAX; j++)
+            state.directories[i][j] = directories[i][j];
+        state.directories[i][j] = '\0';
+    }
+
+    for (i = 0; i < file_count && i < MAX_FILES; i++) {
+        for (j = 0; in_memory_files[i].path[j] && j < INPUT_MAX; j++)
+            state.files[i].path[j] = in_memory_files[i].path[j];
+        state.files[i].path[j] = '\0';
+        state.files[i].content_len = in_memory_files[i].content_len;
+        for (j = 0; j < in_memory_files[i].content_len && j < sizeof(state.files[i].content); j++)
+            state.files[i].content[j] = in_memory_files[i].content[j];
+    }
+
+    fs_persist_write_state(&state);
+}
+
+static void fs_persist_load_current(void)
+{
+    struct persist_state state;
+    uint32_t i;
+
+    dir_count = 0;
+    file_count = 0;
+
+    if (fs_persist_read_state(&state)) {
+        if (state.dir_count <= MAX_DIRS)
+            dir_count = state.dir_count;
+        if (state.file_count <= MAX_FILES)
+            file_count = state.file_count;
+
+        for (i = 0; i < dir_count; i++)
+            str_copy(directories[i], state.directories[i]);
+
+        for (i = 0; i < file_count; i++) {
+            str_copy(in_memory_files[i].path, state.files[i].path);
+            in_memory_files[i].content_len = state.files[i].content_len;
+            if (in_memory_files[i].content_len > sizeof(in_memory_files[i].content) - 1)
+                in_memory_files[i].content_len = sizeof(in_memory_files[i].content) - 1;
+            {
+                uint32_t j;
+                for (j = 0; j < in_memory_files[i].content_len; j++)
+                    in_memory_files[i].content[j] = state.files[i].content[j];
+                in_memory_files[i].content[in_memory_files[i].content_len] = '\0';
+            }
+        }
+    }
+
+    fs_persist_ready = 1;
 }
 
 static inline void interrupts_enable(void)
@@ -183,21 +548,27 @@ static inline void interrupts_disable(void)
 
 static uint32_t term_cols(void)
 {
-    return vga_cols();
+    uint32_t cols = vga_cols();
+    if (cols == 0)
+        return 80;
+    return cols;
 }
 
 static uint32_t term_rows(void)
 {
-    return vga_rows();
+    uint32_t rows = vga_rows();
+    if (rows == 0)
+        return 25;
+    return rows;
 }
 
 static void init_layout(void)
 {
     uint32_t rows = term_rows();
 
-    if (rows >= 15) {
-        ui_status_row = 10;
-        term_top_row = 11;
+    if (rows >= 14) {
+        ui_status_row = 9;
+        term_top_row = 10;
     } else if (rows >= 6) {
         ui_status_row = rows - 4;
         term_top_row = rows - 3;
@@ -248,8 +619,18 @@ static void scheduler_init(void)
 {
     scheduler_ticks = 0;
     scheduler_current_task = 0;
-    /* Minimal round-robin scaffold (shell + idle logical tasks). */
     scheduler_task_count = 2;
+}
+
+static void scheduler_refresh_tasks(void)
+{
+    scheduler_task_count = 2;
+    if (games_editor_is_active())
+        scheduler_task_count++;
+    if (games_is_active())
+        scheduler_task_count++;
+    if (scheduler_current_task >= scheduler_task_count)
+        scheduler_current_task = 0;
 }
 
 static void paging_init(void)
@@ -398,16 +779,23 @@ void exception_handler_c(uint32_t vector, uint32_t error_code)
     u32_to_hex(vector, vector_hex);
     u32_to_hex(error_code, error_hex);
 
-    vga_puts_at("Unhandled CPU exception", VGA_ATTR_TEXT, 2, 2);
+    {
+        uint32_t row;
+        for (row = 0; row < term_rows(); row++)
+            vga_clear_row(row, 0x4F);
+    }
+
+    vga_puts_at("KERNEL PANIC", 0x4F, 2, 2);
+    vga_puts_at("Unhandled CPU exception", 0x4F, 3, 2);
     if (vector < 32)
-        vga_puts_at(exception_names[vector], VGA_ATTR_TEXT, 4, 2);
+        vga_puts_at(exception_names[vector], 0x4F, 5, 2);
     else
-        vga_puts_at("Unknown exception", VGA_ATTR_TEXT, 4, 2);
-    vga_puts_at("Vector:", VGA_ATTR_TEXT, 6, 2);
-    vga_puts_at(vector_hex, VGA_ATTR_TEXT, 6, 10);
-    vga_puts_at("Error:", VGA_ATTR_TEXT, 7, 2);
-    vga_puts_at(error_hex, VGA_ATTR_TEXT, 7, 10);
-    vga_puts_at("System halted to avoid a reboot loop.", VGA_ATTR_TEXT, 9, 2);
+        vga_puts_at("Unknown exception", 0x4F, 5, 2);
+    vga_puts_at("Vector:", 0x4F, 7, 2);
+    vga_puts_at(vector_hex, 0x4F, 7, 10);
+    vga_puts_at("Error:", 0x4F, 8, 2);
+    vga_puts_at(error_hex, 0x4F, 8, 10);
+    vga_puts_at("System halted to avoid data corruption.", 0x4F, 10, 2);
 
     for (;;) {
         __asm__ volatile ("hlt");
@@ -791,18 +1179,26 @@ static void draw_logo(void)
     }
 }
 
+static void draw_splash_screen(void)
+{
+    uint32_t start_tick = scheduler_ticks;
+    vga_clear();
+    draw_logo();
+    vga_puts_at("LC(OS)", VGA_ATTR_TEXT, term_rows() / 2, 2);
+    vga_puts_at("Booting kernel and restoring VFS...", VGA_ATTR_MUTED, term_rows() / 2 + 2, 2);
+    while ((scheduler_ticks - start_tick) < 18u)
+        __asm__ volatile ("hlt");
+}
+
 static void draw_ui(void)
 {
     uint32_t col;
     uint32_t cols = term_cols();
-    uint32_t rows = term_rows();
+    uint32_t border_row = term_top_row > 0 ? term_top_row - 1 : 0;
 
-    if (rows > 8)
-        vga_puts_at("Type 'help' to see available commands.", VGA_ATTR_TEXT, 8, 2);
-
-    if (rows > 9) {
+    if (term_rows() > border_row) {
         for (col = 0; col < cols; col++)
-            vga_put_at('-', VGA_ATTR_TEXT, 9, col);
+            vga_put_at('-', VGA_ATTR_TEXT, border_row, col);
     }
 
     vga_clear_row(ui_status_row, 0x00);
@@ -826,16 +1222,26 @@ static void redraw_input_line(void)
     uint32_t input_len;
     uint32_t linear_len;
     uint32_t required_rows;
+    uint32_t available_rows;
     uint32_t clear_rows;
     uint32_t row_offset;
     uint32_t linear = 0;
     uint32_t i;
     uint32_t index;
 
+    if (term_row < term_top_row)
+        term_row = term_top_row;
+    else if (term_row > term_bottom_row)
+        term_row = term_bottom_row;
+
     if (shell_input_length() == 0 && shell_input_cursor() == 0) {
         input_start_row = term_row;
         input_rendered_rows = 1;
     }
+
+    /* If heavy output/scrolling moved the terminal window, re-anchor prompt safely. */
+    if (input_start_row < term_top_row || input_start_row > term_bottom_row)
+        input_start_row = term_row;
 
     prompt_len = shell_prompt_length();
     input_len = shell_input_length();
@@ -843,6 +1249,13 @@ static void redraw_input_line(void)
     required_rows = linear_len / term_cols();
     if ((linear_len % term_cols()) != 0 || required_rows == 0)
         required_rows++;
+
+    available_rows = term_bottom_row - term_top_row + 1;
+    if (required_rows > available_rows)
+        required_rows = available_rows;
+
+    if (input_start_row + required_rows - 1 > term_bottom_row)
+        input_start_row = term_bottom_row - required_rows + 1;
 
     clear_rows = input_rendered_rows;
     if (required_rows > clear_rows)
@@ -862,17 +1275,17 @@ static void redraw_input_line(void)
         uint32_t col;
 
         input_linear_to_row_col(linear, &row, &col);
-        vga_put_at(shell_current_dir()[index], VGA_ATTR_PROMPT, row, col);
+        vga_put_at(shell_current_dir()[index], VGA_ATTR_TEXT, row, col);
         linear++;
     }
 
-    for (index = 0; index < 3; index++) {
+    for (index = 0; index < 2; index++) {
         uint32_t row;
         uint32_t col;
-        char prompt_ch = (index == 1) ? '>' : ' ';
+        char prompt_ch = (index == 0) ? '>' : ' ';
 
         input_linear_to_row_col(linear, &row, &col);
-        vga_put_at(prompt_ch, VGA_ATTR_PROMPT, row, col);
+        vga_put_at(prompt_ch, VGA_ATTR_TEXT, row, col);
         linear++;
     }
 
@@ -969,6 +1382,56 @@ static uint32_t read_u32_le(const uint8_t *ptr)
            ((uint32_t)ptr[1] << 8) |
            ((uint32_t)ptr[2] << 16) |
            ((uint32_t)ptr[3] << 24);
+}
+
+static void fb_init_from_multiboot(uint32_t magic, uint32_t info_addr)
+{
+    const uint8_t *info;
+    uint32_t total_size;
+    uint32_t offset;
+
+    if (magic != MULTIBOOT2_BOOTLOADER_MAGIC || info_addr == 0)
+        return;
+
+    info = (const uint8_t *)info_addr;
+    total_size = read_u32_le(info);
+    if (total_size < 16)
+        return;
+
+    offset = 8;
+    while (offset + 8 <= total_size) {
+        const struct multiboot2_tag *tag = (const struct multiboot2_tag *)(info + offset);
+        uint32_t aligned_size;
+
+        if (tag->type == MULTIBOOT2_TAG_TYPE_END)
+            break;
+
+        if (tag->size < 8)
+            break;
+
+        if (tag->type == MULTIBOOT2_TAG_TYPE_FRAMEBUFFER) {
+            const struct multiboot2_tag_framebuffer *fbt =
+                (const struct multiboot2_tag_framebuffer *)tag;
+
+            /* Only handle RGB framebuffer (type 1) fitting in 32-bit address space */
+            if (fbt->framebuffer_type == 1 &&
+                fbt->framebuffer_addr_hi == 0 &&
+                (fbt->framebuffer_bpp == 24 || fbt->framebuffer_bpp == 32)) {
+                vga_set_framebuffer(
+                    fbt->framebuffer_addr_lo,
+                    fbt->framebuffer_pitch,
+                    fbt->framebuffer_width,
+                    fbt->framebuffer_height,
+                    fbt->framebuffer_bpp);
+            }
+            break;
+        }
+
+        aligned_size = (tag->size + 7) & ~7u;
+        if (aligned_size == 0 || offset > total_size - aligned_size)
+            break;
+        offset += aligned_size;
+    }
 }
 
 static void fat12_init_from_multiboot(uint32_t magic, uint32_t info_addr)
@@ -1824,9 +2287,26 @@ static int ls_name_has_suffix(const char *name, const char *suffix)
     return 1;
 }
 
+static int ls_name_has_suffix_ignore_case(const char *name, const char *suffix)
+{
+    uint32_t nlen = 0, slen = 0, i;
+    while (name[nlen]) nlen++;
+    while (suffix[slen]) slen++;
+    if (nlen < slen) return 0;
+    for (i = 0; i < slen; i++) {
+        char a = name[nlen - slen + i];
+        char b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+        if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
 static int ls_is_executable(const char *name)
 {
     return ls_name_has_suffix(name, ".lcbat") ||
+           ls_name_has_suffix(name, ".bat") ||
            ls_name_has_suffix(name, "snake") ||
            ls_name_has_suffix(name, "tetris") ||
            ls_name_has_suffix(name, "pingpong");
@@ -1921,7 +2401,7 @@ static void list_directory_internal(const char *dirpath, int show_sizes, int sho
     for (i = 0; i < dir_count_l; i++) {
         term_puts(dir_entries[i].name, VGA_ATTR_DIR);
         if (show_sizes)
-            term_puts(" (<DIR>)", VGA_ATTR_MUTED);
+            term_puts(" <DIR>", VGA_ATTR_MUTED);
         if (show_rights) {
             const char *perm = dir_entries[i].writable ? "  [drw-]" : "  [dr--]";
             term_puts(perm, VGA_ATTR_MUTED);
@@ -2036,21 +2516,60 @@ static int copy_directory_tree(const char *src_dir, const char *dst_dir)
 
 void os_term_puts(const char *s, uint8_t attr)
 {
+    (void)attr;
+    if (term_capture_active) {
+        while (*s && term_capture_len + 1 < sizeof(term_capture_buffer))
+            term_capture_buffer[term_capture_len++] = *s++;
+        term_capture_buffer[term_capture_len] = '\0';
+        return;
+    }
     term_puts(s, attr);
 }
 
 void os_term_newline(void)
 {
+    if (term_capture_active) {
+        if (term_capture_len + 1 < sizeof(term_capture_buffer)) {
+            term_capture_buffer[term_capture_len++] = '\n';
+            term_capture_buffer[term_capture_len] = '\0';
+        }
+        return;
+    }
     term_newline();
 }
 
 void os_term_clear(void)
 {
+    if (term_capture_active) {
+        term_capture_len = 0;
+        term_capture_buffer[0] = '\0';
+        return;
+    }
     cursor_hide();
     vga_clear();
     draw_logo();
     draw_ui();
     term_prompt();
+}
+
+void os_term_capture_begin(void)
+{
+    term_capture_active = 1;
+    term_capture_len = 0;
+    term_capture_buffer[0] = '\0';
+}
+
+void os_term_capture_end(char *out, uint32_t out_size)
+{
+    uint32_t i = 0;
+    term_capture_active = 0;
+    if (out_size == 0)
+        return;
+    while (term_capture_buffer[i] && i + 1 < out_size) {
+        out[i] = term_capture_buffer[i];
+        i++;
+    }
+    out[i] = '\0';
 }
 
 void os_redraw_input_line(void)
@@ -2068,9 +2587,44 @@ void os_cursor_reset_blink(void)
     cursor_reset_blink();
 }
 
+void os_wait_for_keypress(void)
+{
+    for (;;) {
+        struct key_event event = keyboard_poll_event();
+
+        if (event.type != KEY_NONE)
+            return;
+
+        __asm__ volatile ("hlt"); /* sleep until next IRQ */
+    }
+}
+
+int os_check_ctrl_c(void)
+{
+    struct key_event event = keyboard_poll_event();
+    return event.type == KEY_CTRL_C ? 1 : 0;
+}
+
 uint32_t os_term_cols(void)
 {
     return term_cols();
+}
+
+void os_pipe_input_set(const char *text)
+{
+    uint32_t i = 0;
+    if (text == 0)
+        text = "";
+    while (text[i] && i + 1 < sizeof(pipe_input_buffer)) {
+        pipe_input_buffer[i] = text[i];
+        i++;
+    }
+    pipe_input_buffer[i] = '\0';
+}
+
+const char *os_pipe_input_get(void)
+{
+    return pipe_input_buffer;
 }
 
 int os_fs_resolve_path(const char *arg, char *out)
@@ -2102,12 +2656,16 @@ int os_fs_add_dir(const char *path)
         return 0;
 
     add_directory(path);
+    fs_persist_save_current();
     return dir_exists(path);
 }
 
 int os_fs_remove_dir(const char *path)
 {
-    return remove_memory_dir(path);
+    int ok = remove_memory_dir(path);
+    if (ok)
+        fs_persist_save_current();
+    return ok;
 }
 
 void os_fs_list_directory(const char *path)
@@ -2145,17 +2703,142 @@ const char *os_fs_get_file_content(const char *path)
     return get_file_content_any(path);
 }
 
+int os_fs_read_extension_matches(const char *dirpath, const char *ext)
+{
+    uint32_t i;
+    int printed = 0;
+
+    i = 0;
+    while (fs_files[i].name != 0) {
+        if (str_eq(fs_files[i].dir_path, dirpath) &&
+            find_memory_file(fs_files[i].path) == 0 &&
+            ls_name_has_suffix_ignore_case(fs_files[i].name, ext)) {
+            if (printed)
+                term_newline();
+            term_puts("== ", VGA_ATTR_TEXT);
+            term_puts(fs_files[i].name, VGA_ATTR_FILE);
+            term_puts(" ==", VGA_ATTR_TEXT);
+            term_newline();
+            term_puts(fs_files[i].content, VGA_ATTR_TEXT);
+            if (fs_files[i].content[0] != '\0' &&
+                fs_files[i].content[text_len(fs_files[i].content) - 1] != '\n')
+                term_newline();
+            printed = 1;
+        }
+        i++;
+    }
+
+    for (i = 0; i < file_count; i++) {
+        const char *file_path = in_memory_files[i].path;
+        uint32_t parent_len = path_parent_length(file_path);
+        char parent_dir[INPUT_MAX + 1];
+        const char *fname;
+
+        if (parent_len == 0) {
+            parent_dir[0] = '/';
+            parent_dir[1] = '\0';
+        } else {
+            uint32_t j;
+            for (j = 0; j < parent_len; j++)
+                parent_dir[j] = file_path[j];
+            parent_dir[parent_len] = '\0';
+        }
+
+        fname = &file_path[parent_len + 1];
+        if (str_eq(parent_dir, dirpath) && ls_name_has_suffix_ignore_case(fname, ext)) {
+            if (printed)
+                term_newline();
+            term_puts("== ", VGA_ATTR_TEXT);
+            term_puts(fname, VGA_ATTR_FILE);
+            term_puts(" ==", VGA_ATTR_TEXT);
+            term_newline();
+            term_puts(in_memory_files[i].content, VGA_ATTR_TEXT);
+            if (in_memory_files[i].content_len > 0 &&
+                in_memory_files[i].content[in_memory_files[i].content_len - 1] != '\n')
+                term_newline();
+            printed = 1;
+        }
+    }
+
+    return printed;
+}
+
+int os_fs_collect_extension_matches(const char *dirpath, const char *ext, char *out, uint32_t out_size)
+{
+    uint32_t i;
+    uint32_t pos = 0;
+
+    if (out_size == 0)
+        return 0;
+
+    out[0] = '\0';
+
+    i = 0;
+    while (fs_files[i].name != 0) {
+        if (str_eq(fs_files[i].dir_path, dirpath) &&
+            find_memory_file(fs_files[i].path) == 0 &&
+            ls_name_has_suffix_ignore_case(fs_files[i].name, ext)) {
+            uint32_t j = 0;
+            while (fs_files[i].path[j] && pos + 1 < out_size)
+                out[pos++] = fs_files[i].path[j++];
+            if (pos + 1 >= out_size)
+                break;
+            out[pos++] = '\n';
+            out[pos] = '\0';
+        }
+        i++;
+    }
+
+    for (i = 0; i < file_count; i++) {
+        const char *file_path = in_memory_files[i].path;
+        uint32_t parent_len = path_parent_length(file_path);
+        char parent_dir[INPUT_MAX + 1];
+        const char *fname;
+
+        if (parent_len == 0) {
+            parent_dir[0] = '/';
+            parent_dir[1] = '\0';
+        } else {
+            uint32_t j;
+            for (j = 0; j < parent_len; j++)
+                parent_dir[j] = file_path[j];
+            parent_dir[parent_len] = '\0';
+        }
+
+        fname = &file_path[parent_len + 1];
+        if (str_eq(parent_dir, dirpath) && ls_name_has_suffix_ignore_case(fname, ext)) {
+            uint32_t j = 0;
+            while (file_path[j] && pos + 1 < out_size)
+                out[pos++] = file_path[j++];
+            if (pos + 1 >= out_size)
+                break;
+            out[pos++] = '\n';
+            out[pos] = '\0';
+        }
+    }
+
+    return pos > 0;
+}
+
 int os_fs_write_file(const char *path, const char *content)
 {
     if (path_has_forbidden_name_chars(path))
         return 0;
 
-    return write_memory_file(path, content);
+    {
+        int ok = write_memory_file(path, content);
+        if (ok)
+            fs_persist_save_current();
+        return ok;
+    }
 }
 
 int os_fs_remove_file(const char *path)
 {
-    return remove_memory_file(path);
+    int ok = remove_memory_file(path);
+    if (ok)
+        fs_persist_save_current();
+    return ok;
 }
 
 int os_fs_copy_file(const char *src, const char *dst)
@@ -2163,7 +2846,12 @@ int os_fs_copy_file(const char *src, const char *dst)
     if (path_has_forbidden_name_chars(dst))
         return 0;
 
-    return copy_file_internal(src, dst);
+    {
+        int ok = copy_file_internal(src, dst);
+        if (ok)
+            fs_persist_save_current();
+        return ok;
+    }
 }
 
 int os_fs_move_file(const char *src, const char *dst)
@@ -2174,7 +2862,12 @@ int os_fs_move_file(const char *src, const char *dst)
     if (!copy_file_internal(src, dst))
         return 0;
 
-    return remove_memory_file(src);
+    {
+        int ok = remove_memory_file(src);
+        if (ok)
+            fs_persist_save_current();
+        return ok;
+    }
 }
 
 int os_fs_copy_dir(const char *src, const char *dst)
@@ -2185,7 +2878,12 @@ int os_fs_copy_dir(const char *src, const char *dst)
     if (!dir_exists(src))
         return 0;
 
-    return copy_directory_tree(src, dst);
+    {
+        int ok = copy_directory_tree(src, dst);
+        if (ok)
+            fs_persist_save_current();
+        return ok;
+    }
 }
 
 int os_fs_move_dir(const char *src, const char *dst)
@@ -2232,7 +2930,12 @@ int os_fs_move_dir(const char *src, const char *dst)
         }
     }
 
-    return 1;
+    {
+        int ok = remove_memory_dir(src);
+        if (ok)
+            fs_persist_save_current();
+        return ok;
+    }
 }
 
 int os_fs_path_name_is_valid(const char *path)
@@ -2242,11 +2945,17 @@ int os_fs_path_name_is_valid(const char *path)
 
 int os_game_launch(const char *path)
 {
-    return games_start_path(path);
+    return programs_launch_path(path);
+}
+
+int os_editor_open(const char *path)
+{
+    return games_start_editor(path);
 }
 
 void os_power_shutdown(void)
 {
+    fs_persist_save_current();
     /* QEMU ACPI power-off. */
     outw(0x604, 0x2000);
     outw(0xB004, 0x2000);
@@ -2258,6 +2967,7 @@ void os_power_shutdown(void)
 
 void os_power_reboot(void)
 {
+    fs_persist_save_current();
     reboot_request();
 }
 
@@ -2267,6 +2977,106 @@ const char *os_cpu_arch(void)
         return "CPU: x86_64-capable (kernel mode: i386)";
 
     return "CPU: i386-compatible";
+}
+
+void os_storage_probe(int *ata_legacy,
+                      int *ahci,
+                      int *usb_uhci,
+                      int *usb_ohci,
+                      int *usb_ehci,
+                      int *usb_xhci)
+{
+    uint8_t status;
+    uint32_t bus;
+    uint32_t dev;
+    uint32_t func;
+
+    if (ata_legacy) *ata_legacy = 0;
+    if (ahci) *ahci = 0;
+    if (usb_uhci) *usb_uhci = 0;
+    if (usb_ohci) *usb_ohci = 0;
+    if (usb_ehci) *usb_ehci = 0;
+    if (usb_xhci) *usb_xhci = 0;
+
+    /* Quick legacy ATA presence probe (PIO primary status register). */
+    status = inb(0x1F7);
+    if (status != 0xFF && ata_legacy)
+        *ata_legacy = 1;
+
+    /* PCI config-space scan via 0xCF8/0xCFC. */
+    for (bus = 0; bus < 256; bus++) {
+        for (dev = 0; dev < 32; dev++) {
+            for (func = 0; func < 8; func++) {
+                uint32_t addr = 0x80000000u |
+                                (bus << 16) |
+                                (dev << 11) |
+                                (func << 8);
+                uint32_t id;
+                uint16_t vendor;
+                uint32_t class_reg;
+                uint8_t class_code;
+                uint8_t subclass;
+                uint8_t prog_if;
+
+                outl(0xCF8, addr);
+                id = inl(0xCFC);
+                vendor = (uint16_t)(id & 0xFFFFu);
+                if (vendor == 0xFFFFu)
+                    continue;
+
+                outl(0xCF8, addr | 0x08u);
+                class_reg = inl(0xCFC);
+                class_code = (uint8_t)((class_reg >> 24) & 0xFFu);
+                subclass = (uint8_t)((class_reg >> 16) & 0xFFu);
+                prog_if = (uint8_t)((class_reg >> 8) & 0xFFu);
+
+                /* Mass storage */
+                if (class_code == 0x01u) {
+                    if (subclass == 0x01u && ata_legacy)
+                        *ata_legacy = 1; /* IDE */
+                    if (subclass == 0x06u && prog_if == 0x01u && ahci)
+                        *ahci = 1; /* SATA AHCI */
+                }
+
+                /* Serial bus controller / USB */
+                if (class_code == 0x0Cu && subclass == 0x03u) {
+                    if (prog_if == 0x00u && usb_uhci) *usb_uhci = 1;
+                    if (prog_if == 0x10u && usb_ohci) *usb_ohci = 1;
+                    if (prog_if == 0x20u && usb_ehci) *usb_ehci = 1;
+                    if (prog_if == 0x30u && usb_xhci) *usb_xhci = 1;
+                }
+            }
+        }
+    }
+}
+
+uint32_t os_scheduler_ticks(void)
+{
+    return scheduler_ticks;
+}
+
+uint32_t os_scheduler_current_task(void)
+{
+    return scheduler_current_task;
+}
+
+uint32_t os_scheduler_task_count(void)
+{
+    return scheduler_task_count;
+}
+
+const char *os_scheduler_task_name(uint32_t index)
+{
+    if (index == 0)
+        return "shell";
+    if (index == 1)
+        return "idle";
+    if (index == 2 && games_editor_is_active())
+        return "editor";
+    if ((index == 2 && games_is_active() && !games_editor_is_active()) ||
+        (index == 3 && games_is_active()))
+        return "game";
+    return "unknown";
 }
 
 static char alpha_with_case(char lower, int shift)
@@ -2405,6 +3215,22 @@ static struct key_event keyboard_decode(uint8_t raw_scancode)
         return event;
     }
 
+    if (ctrl_down && scancode == 0x1F) {
+        event.type = KEY_CTRL_S;
+        event.code = 19;
+        event.has_code = 1;
+        event.label = "Ctrl+S";
+        return event;
+    }
+
+    if (ctrl_down && scancode == 0x12) {
+        event.type = KEY_CTRL_E;
+        event.code = 5;
+        event.has_code = 1;
+        event.label = "Ctrl+E";
+        return event;
+    }
+
     if (scancode == 0x3A) {
         caps_lock_enabled = !caps_lock_enabled;
         event.type = KEY_CAPSLOCK;
@@ -2484,10 +3310,14 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr)
     scheduler_init();
     cpu_x86_64_capable = cpu_has_long_mode();
     vga_init();
+    fb_init_from_multiboot(multiboot_magic, multiboot_info_addr);
     init_layout();
     interrupts_init();
     fat12_init_from_multiboot(multiboot_magic, multiboot_info_addr);
+    fs_persist_load_current();
     interrupts_enable();
+
+    draw_splash_screen();
 
     vga_clear();
     draw_logo();
@@ -2498,6 +3328,8 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr)
     draw_status(&(struct key_event){ KEY_NONE, 0, 0, 0, "ready" });
 
     for (;;) {
+        scheduler_refresh_tasks();
+
         if (reboot_take_requested()) {
             vga_clear();
             draw_logo();
@@ -2514,16 +3346,19 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr)
         if (event.type == KEY_NONE) {
             if (games_is_active())
                 games_tick(scheduler_ticks);
-            else
+            else if (!games_editor_is_active())
                 cursor_tick();
 
-            if (game_was_active && !games_is_active()) {
+            if (game_was_active && !games_is_active() && !games_editor_is_active()) {
                 os_redraw_input_line();
                 draw_status(&(struct key_event){ KEY_NONE, 0, 0, 0, "ready" });
                 game_was_active = 0;
             }
 
-            __asm__ volatile ("pause");
+            if (games_is_active() || games_editor_is_active())
+                __asm__ volatile ("pause"); /* games need fast ticks */
+            else
+                __asm__ volatile ("hlt");   /* sleep until next IRQ */
             continue;
         }
 
@@ -2537,9 +3372,20 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr)
             continue;
         }
 
+        if (games_editor_is_active()) {
+            games_handle_event(&event);
+            if (!games_editor_is_active()) {
+                os_redraw_input_line();
+                draw_status(&(struct key_event){ KEY_NONE, 0, 0, 0, "ready" });
+            }
+            continue;
+        }
+
         shell_handle_event(&event);
         if (games_is_active())
             game_was_active = 1;
+        else if (games_editor_is_active())
+            game_was_active = 0;
         else
             draw_status(&event);
     }

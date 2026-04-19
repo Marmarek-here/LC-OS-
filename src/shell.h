@@ -5,6 +5,7 @@
 
 void shell_init(void);
 void shell_handle_event(const struct key_event *event);
+void shell_run_line(const char *input);
 
 const char *shell_current_dir(void);
 void shell_set_current_dir(const char *path);

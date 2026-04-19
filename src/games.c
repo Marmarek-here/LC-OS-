@@ -1,10 +1,12 @@
 #include "games.h"
 
+#include "os_api.h"
 #include "vga.h"
 
 #define ATTR_BG 0x10
-#define ATTR_TEXT 0x1F
-#define ATTR_MUTED 0x17
+#define ATTR_TEXT 0x0F
+#define ATTR_MUTED 0x07
+#define ATTR_EDITOR_BG 0x07
 #define ATTR_SNAKE 0x2A
 #define ATTR_FOOD 0x4E
 #define ATTR_PADDLE 0x1B
@@ -14,15 +16,17 @@
 #define ATTR_TETRIS3 0x3E
 #define ATTR_TETRIS4 0x4E
 
-#define GAME_SCREEN_MAX_COLS 300
-#define GAME_SCREEN_MAX_ROWS 200
+/* Support up to 160 cols × 60 rows — covers every standard VGA/SVGA text mode. */
+#define GAME_SCREEN_MAX_COLS 160
+#define GAME_SCREEN_MAX_ROWS  60
 #define GAME_SCREEN_MAX_CELLS (GAME_SCREEN_MAX_COLS * GAME_SCREEN_MAX_ROWS)
 
 enum game_id {
     GAME_NONE = 0,
     GAME_SNAKE,
     GAME_TETRIS,
-    GAME_PINGPONG
+    GAME_PINGPONG,
+    GAME_EDITOR
 };
 
 struct snake_state {
@@ -62,6 +66,14 @@ struct tetris_state {
     struct tetris_piece piece;
 };
 
+struct editor_state {
+    char path[INPUT_MAX + 1];
+    char buffer[2048];
+    uint32_t length;
+    uint32_t cursor;
+    char status[48];
+};
+
 static enum game_id active_game = GAME_NONE;
 static uint32_t last_tick = 0;
 static uint32_t rng_state = 0x12345678u;
@@ -72,6 +84,10 @@ static int saved_screen_valid = 0;
 static struct snake_state snake;
 static struct pong_state pong;
 static struct tetris_state tetris;
+static struct editor_state editor;
+static int editor_frame_initialized = 0;
+static uint32_t editor_frame_cols = 0;
+static uint32_t editor_frame_rows = 0;
 
 static uint32_t str_len(const char *s)
 {
@@ -107,6 +123,16 @@ static uint32_t next_rand(void)
 {
     rng_state = rng_state * 1664525u + 1013904223u;
     return rng_state;
+}
+
+static void str_copy(char *dst, const char *src)
+{
+    while (*src) {
+        *dst = *src;
+        dst++;
+        src++;
+    }
+    *dst = '\0';
 }
 
 static void u32_to_dec(uint32_t value, char *buffer)
@@ -165,8 +191,11 @@ static void restore_screen(void)
     uint32_t row;
     uint32_t col;
 
-    if (!saved_screen_valid)
+    if (!saved_screen_valid) {
+        /* Can't restore — redraw the shell UI cleanly instead of leaving garbage. */
+        os_term_clear();
         return;
+    }
 
     for (row = 0; row < saved_screen_rows; row++) {
         for (col = 0; col < saved_screen_cols; col++)
@@ -201,6 +230,164 @@ static void game_draw_header(const char *title, uint32_t score)
     u32_to_dec(score, score_buf);
     put_text(0, 2, "Score: ", ATTR_TEXT);
     put_text(0, 9, score_buf, ATTR_TEXT);
+}
+
+static void editor_render(void)
+{
+    uint32_t cols = vga_cols();
+    uint32_t rows = vga_rows();
+    uint32_t usable_bottom = rows > 2 ? rows - 3 : rows;
+    uint32_t r;
+    uint32_t c = 0;
+    uint32_t i = 0;
+    uint32_t cursor_row = 4;
+    uint32_t cursor_col = 0;
+    int cursor_found = 0;
+
+    if (!editor_frame_initialized || editor_frame_cols != cols || editor_frame_rows != rows) {
+        clear_screen(ATTR_EDITOR_BG);
+        put_text(0, 0, "Edit: ", ATTR_TEXT);
+        put_text(0, 6, editor.path, ATTR_TEXT);
+        center_text(1, "Text Editor", ATTR_MUTED);
+        put_text(3, 0, "Ctrl+S Save  |  Ctrl+E Exit  |  Arrows Move  |  Enter New line", ATTR_TEXT);
+
+        if (rows >= 2) {
+            uint32_t help_col;
+            for (help_col = 0; help_col < cols; help_col++)
+                vga_put_at('-', ATTR_MUTED, rows - 2, help_col);
+            for (help_col = 0; help_col < cols; help_col++)
+                vga_put_at(' ', ATTR_TEXT, rows - 1, help_col);
+            put_text(rows - 1, 0, " Ctrl+S: Save  |  Ctrl+E: Exit  |  Arrows: Move  |  Enter: New line ", ATTR_TEXT);
+        }
+
+        editor_frame_initialized = 1;
+        editor_frame_cols = cols;
+        editor_frame_rows = rows;
+    }
+
+    vga_clear_row(2, ATTR_EDITOR_BG);
+    put_text(2, 0, editor.status, ATTR_MUTED);
+
+    for (r = 4; r <= usable_bottom; r++)
+        vga_clear_row(r, ATTR_EDITOR_BG);
+
+    r = 4;
+
+    while (r <= usable_bottom && i <= editor.length) {
+        if (i == editor.cursor && !cursor_found) {
+            cursor_row = r;
+            cursor_col = c;
+            cursor_found = 1;
+        }
+
+        if (i == editor.length)
+            break;
+
+        if (editor.buffer[i] == '\n') {
+            r++;
+            c = 0;
+            i++;
+            continue;
+        }
+
+        vga_put_at(editor.buffer[i], ATTR_TEXT, r, c);
+        c++;
+        if (c >= cols) {
+            c = 0;
+            r++;
+        }
+        i++;
+    }
+
+    if (!cursor_found) {
+        cursor_row = r;
+        cursor_col = c;
+    }
+
+    if (cursor_row <= usable_bottom) {
+        uint16_t cell = vga_get_cell(cursor_row, cursor_col);
+        uint8_t ch = (uint8_t)(cell & 0xFF);
+        uint8_t attr = (uint8_t)((cell >> 8) & 0xFF);
+
+        if (ch == ' ')
+            vga_put_at('_', ATTR_TEXT, cursor_row, cursor_col);
+        else
+            vga_set_cell(cursor_row, cursor_col, vga_entry((char)ch, (uint8_t)((attr << 4) | (attr >> 4))));
+    }
+}
+
+static void editor_move_vertical(int direction)
+{
+    uint32_t i;
+    uint32_t line_start = 0;
+    uint32_t col = 0;
+    uint32_t target_start;
+    uint32_t target_len = 0;
+
+    for (i = 0; i < editor.cursor; i++) {
+        if (editor.buffer[i] == '\n')
+            line_start = i + 1;
+    }
+
+    col = editor.cursor - line_start;
+
+    if (direction < 0) {
+        uint32_t prev_end;
+        if (line_start == 0)
+            return;
+        prev_end = line_start - 1;
+        target_start = 0;
+        for (i = 0; i < prev_end; i++) {
+            if (editor.buffer[i] == '\n')
+                target_start = i + 1;
+        }
+    } else {
+        i = line_start;
+        while (i < editor.length && editor.buffer[i] != '\n')
+            i++;
+        if (i >= editor.length)
+            return;
+        target_start = i + 1;
+    }
+
+    i = target_start;
+    while (i < editor.length && editor.buffer[i] != '\n') {
+        target_len++;
+        i++;
+    }
+
+    editor.cursor = target_start + (col < target_len ? col : target_len);
+}
+
+static void editor_insert_char(char ch)
+{
+    uint32_t i;
+
+    if (editor.length >= sizeof(editor.buffer) - 1)
+        return;
+
+    for (i = editor.length; i > editor.cursor; i--)
+        editor.buffer[i] = editor.buffer[i - 1];
+
+    editor.buffer[editor.cursor] = ch;
+    editor.cursor++;
+    editor.length++;
+    editor.buffer[editor.length] = '\0';
+}
+
+static void editor_backspace(void)
+{
+    uint32_t i;
+
+    if (editor.cursor == 0 || editor.length == 0)
+        return;
+
+    for (i = editor.cursor - 1; i < editor.length - 1; i++)
+        editor.buffer[i] = editor.buffer[i + 1];
+
+    editor.cursor--;
+    editor.length--;
+    editor.buffer[editor.length] = '\0';
 }
 
 static void snake_spawn_food(void)
@@ -606,45 +793,170 @@ static void tetris_try_rotate(int direction)
     }
 }
 
+int games_launch_snake(void)
+{
+    save_screen();
+    rng_state ^= (uint32_t)vga_cols() << 16;
+    rng_state ^= (uint32_t)vga_rows();
+    active_game = GAME_SNAKE;
+    last_tick = 0;
+    snake_reset();
+    return 1;
+}
+
+int games_launch_tetris(void)
+{
+    save_screen();
+    rng_state ^= (uint32_t)vga_cols() << 16;
+    rng_state ^= (uint32_t)vga_rows();
+    active_game = GAME_TETRIS;
+    last_tick = 0;
+    tetris_reset();
+    return 1;
+}
+
+int games_launch_pingpong(void)
+{
+    save_screen();
+    rng_state ^= (uint32_t)vga_cols() << 16;
+    rng_state ^= (uint32_t)vga_rows();
+    active_game = GAME_PINGPONG;
+    last_tick = 0;
+    pong_reset();
+    return 1;
+}
+
+int games_start_editor(const char *path)
+{
+    const char *content = os_fs_get_file_content(path);
+    uint32_t i = 0;
+
+    os_cursor_hide();
+    save_screen();
+    active_game = GAME_EDITOR;
+    last_tick = 0;
+    editor_frame_initialized = 0;
+
+    str_copy(editor.path, path);
+    editor.length = 0;
+    editor.cursor = 0;
+    str_copy(editor.status, "Ready");
+
+    if (content) {
+        while (content[i] && i < sizeof(editor.buffer) - 1) {
+            editor.buffer[i] = content[i];
+            i++;
+        }
+        editor.length = i;
+    }
+    editor.buffer[editor.length] = '\0';
+
+    editor_render();
+    return 1;
+}
+
 int games_start_path(const char *path)
 {
     const char *name = path_basename(path);
 
-    save_screen();
-    rng_state ^= (uint32_t)vga_cols() << 16;
-    rng_state ^= (uint32_t)vga_rows();
-
-    if (str_eq(name, "snake")) {
-        active_game = GAME_SNAKE;
-        last_tick = 0;
-        snake_reset();
-        return 1;
-    }
-    if (str_eq(name, "tetris")) {
-        active_game = GAME_TETRIS;
-        last_tick = 0;
-        tetris_reset();
-        return 1;
-    }
-    if (str_eq(name, "pingpong")) {
-        active_game = GAME_PINGPONG;
-        last_tick = 0;
-        pong_reset();
-        return 1;
-    }
+    if (str_eq(name, "snake"))
+        return games_launch_snake();
+    if (str_eq(name, "tetris"))
+        return games_launch_tetris();
+    if (str_eq(name, "pingpong"))
+        return games_launch_pingpong();
 
     return 0;
 }
 
 int games_is_active(void)
 {
-    return active_game != GAME_NONE;
+    return active_game != GAME_NONE && active_game != GAME_EDITOR;
+}
+
+int games_editor_is_active(void)
+{
+    return active_game == GAME_EDITOR;
 }
 
 void games_handle_event(const struct key_event *event)
 {
     if (active_game == GAME_NONE)
         return;
+
+    if (active_game == GAME_EDITOR) {
+        if (event->type == KEY_CTRL_E) {
+            restore_screen();
+            active_game = GAME_NONE;
+            os_redraw_input_line();
+            os_cursor_reset_blink();
+            return;
+        }
+
+        if (event->type == KEY_CTRL_S) {
+            if (os_fs_write_file(editor.path, editor.buffer))
+                str_copy(editor.status, "Saved");
+            else
+                str_copy(editor.status, "Save failed");
+            editor_render();
+            return;
+        }
+
+        if (event->type == KEY_CHAR) {
+            editor_insert_char(event->ch);
+            editor_render();
+            return;
+        }
+
+        if (event->type == KEY_ENTER) {
+            editor_insert_char('\n');
+            editor_render();
+            return;
+        }
+
+        if (event->type == KEY_TAB) {
+            editor_insert_char(' ');
+            editor_insert_char(' ');
+            editor_insert_char(' ');
+            editor_insert_char(' ');
+            editor_render();
+            return;
+        }
+
+        if (event->type == KEY_BACKSPACE) {
+            editor_backspace();
+            editor_render();
+            return;
+        }
+
+        if (event->type == KEY_LEFT) {
+            if (editor.cursor > 0)
+                editor.cursor--;
+            editor_render();
+            return;
+        }
+
+        if (event->type == KEY_RIGHT) {
+            if (editor.cursor < editor.length)
+                editor.cursor++;
+            editor_render();
+            return;
+        }
+
+        if (event->type == KEY_UP) {
+            editor_move_vertical(-1);
+            editor_render();
+            return;
+        }
+
+        if (event->type == KEY_DOWN) {
+            editor_move_vertical(1);
+            editor_render();
+            return;
+        }
+
+        return;
+    }
 
     if (event->type == KEY_CTRL_C) {
         restore_screen();
@@ -706,6 +1018,9 @@ void games_tick(uint32_t ticks)
     uint32_t interval;
 
     if (active_game == GAME_NONE)
+        return;
+
+    if (active_game == GAME_EDITOR)
         return;
 
     interval = active_game == GAME_TETRIS ? 8u : 4u;

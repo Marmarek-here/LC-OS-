@@ -14,6 +14,8 @@ static uint32_t shell_history_count = 0;
 static int shell_history_view = -1;
 static char shell_history_draft[INPUT_MAX + 1];
 
+static char ascii_to_lower(char ch);
+
 static int char_is_space(char ch)
 {
     return ch == ' ' || ch == '\t';
@@ -42,6 +44,19 @@ static int str_eq(const char *left, const char *right)
     return left[index] == right[index];
 }
 
+static int str_starts_with_ignore_case(const char *text, const char *prefix)
+{
+    uint32_t i = 0;
+
+    while (prefix[i]) {
+        if (ascii_to_lower(text[i]) != ascii_to_lower(prefix[i]))
+            return 0;
+        i++;
+    }
+
+    return 1;
+}
+
 static int str_starts_with(const char *text, const char *prefix)
 {
     uint32_t i = 0;
@@ -55,7 +70,14 @@ static int str_starts_with(const char *text, const char *prefix)
     return 1;
 }
 
-static int str_has_suffix(const char *text, const char *suffix)
+static char ascii_to_lower(char ch)
+{
+    if (ch >= 'A' && ch <= 'Z')
+        return (char)(ch + ('a' - 'A'));
+    return ch;
+}
+
+static int str_has_suffix_ignore_case(const char *text, const char *suffix)
 {
     uint32_t tlen = str_len(text);
     uint32_t slen = str_len(suffix);
@@ -65,11 +87,17 @@ static int str_has_suffix(const char *text, const char *suffix)
         return 0;
 
     for (i = 0; i < slen; i++) {
-        if (text[tlen - slen + i] != suffix[i])
+        if (ascii_to_lower(text[tlen - slen + i]) != ascii_to_lower(suffix[i]))
             return 0;
     }
 
     return 1;
+}
+
+static int path_is_batch_script(const char *path)
+{
+    return str_has_suffix_ignore_case(path, ".lcbat") ||
+           str_has_suffix_ignore_case(path, ".bat");
 }
 
 static void str_copy(char *dst, const char *src)
@@ -211,11 +239,83 @@ static void shell_move_right(void)
 
 static void shell_insert_tab(void)
 {
-    uint32_t spaces = 4 - (shell_input_cursor_value % 4);
-    uint32_t index;
+    char token[INPUT_MAX + 1];
+    uint32_t token_len = 0;
+    uint32_t i;
+    uint32_t count;
+    uint32_t match_count = 0;
+    uint32_t common_len = 0;
+    const char *single_match = 0;
+    const struct builtin_command *commands;
 
-    for (index = 0; index < spaces; index++)
-        shell_insert_char(' ');
+    if (shell_input_cursor_value == 0 || shell_input_cursor_value != shell_input_length_value) {
+        uint32_t spaces = 4 - (shell_input_cursor_value % 4);
+        for (i = 0; i < spaces; i++)
+            shell_insert_char(' ');
+        return;
+    }
+
+    for (i = 0; i < shell_input_cursor_value; i++) {
+        if (char_is_space(shell_input_buffer[i])) {
+            uint32_t spaces = 4 - (shell_input_cursor_value % 4);
+            for (i = 0; i < spaces; i++)
+                shell_insert_char(' ');
+            return;
+        }
+        token[token_len++] = shell_input_buffer[i];
+    }
+    token[token_len] = '\0';
+
+    commands = builtin_commands_get(&count);
+    for (i = 0; i < count; i++) {
+        if (str_starts_with_ignore_case(commands[i].name, token)) {
+            if (match_count == 0) {
+                uint32_t j = 0;
+                single_match = commands[i].name;
+                while (commands[i].name[j])
+                    j++;
+                common_len = j;
+            } else {
+                uint32_t j = 0;
+                while (j < common_len && commands[i].name[j] &&
+                       ascii_to_lower(commands[i].name[j]) == ascii_to_lower(single_match[j]))
+                    j++;
+                common_len = j;
+            }
+            match_count++;
+        }
+    }
+
+    if (match_count == 0) {
+        os_cursor_reset_blink();
+        return;
+    }
+
+    if (common_len > token_len) {
+        shell_input_length_value = common_len;
+        shell_input_cursor_value = common_len;
+        for (i = 0; i < common_len; i++)
+            shell_input_buffer[i] = single_match[i];
+        shell_input_buffer[common_len] = '\0';
+        if (match_count == 1 && shell_input_length_value < INPUT_MAX) {
+            shell_input_buffer[shell_input_length_value++] = ' ';
+            shell_input_buffer[shell_input_length_value] = '\0';
+            shell_input_cursor_value = shell_input_length_value;
+        }
+        os_redraw_input_line();
+        return;
+    }
+
+    os_cursor_hide();
+    os_term_newline();
+    for (i = 0; i < count; i++) {
+        if (str_starts_with_ignore_case(commands[i].name, token)) {
+            os_term_puts(commands[i].name, OS_ATTR_TEXT);
+            os_term_puts("  ", OS_ATTR_TEXT);
+        }
+    }
+    os_term_newline();
+    os_redraw_input_line();
 }
 
 static void shell_print_help(void)
@@ -228,8 +328,8 @@ static void shell_print_help(void)
     os_term_puts("Built-in commands:", OS_ATTR_MUTED);
     os_term_newline();
 
-    if (cols < 96) {
-        /* Narrow terminals: one command per line to avoid wrap artifacts. */
+    if (cols < 56) {
+        /* Very narrow terminals: one command per line. */
         for (i = 0; i < count; i++) {
             os_term_puts(commands[i].name, OS_ATTR_TEXT);
             os_term_puts(" : ", OS_ATTR_TEXT);
@@ -283,7 +383,7 @@ static void shell_print_help(void)
     }
 }
 
-static void shell_execute(const char *input)
+static void shell_execute_simple(const char *input)
 {
     char command[INPUT_MAX + 1];
     char command_name[INPUT_MAX + 1];
@@ -306,6 +406,11 @@ static void shell_execute(const char *input)
     if (command[0] == '\0')
         return;
 
+    if (command[0] == '/' && path_is_batch_script(command)) {
+        builtin_commands_execute("run", command);
+        return;
+    }
+
     if (str_starts_with(command, "/programs/")) {
         if (os_game_launch(command))
             return;
@@ -315,15 +420,25 @@ static void shell_execute(const char *input)
 
     str_copy(command_name, command);
 
+    /* Normalise to lowercase so commands are case-insensitive */
+    {
+        uint32_t ci;
+        for (ci = 0; command_name[ci]; ci++) {
+            char ch = command_name[ci];
+            if (ch >= 'A' && ch <= 'Z')
+                command_name[ci] = (char)(ch + ('a' - 'A'));
+        }
+    }
+
     if (str_eq(command_name, "help")) {
         shell_print_help();
         return;
     }
 
     if (!builtin_commands_execute(command_name, args)) {
-        /* Try running as a file in the current directory.
-           Bare name ending in .lcbat  →  run <curdir>/<name>
-           ./name                      →  run <curdir>/<name>        */
+          /* Try running a batch file in the current directory.
+              Bare name ending in .lcbat/.bat  →  run <curdir>/<name>
+              ./name                           →  run <curdir>/<name> */
         char run_path[INPUT_MAX + 1];
         const char *target = command_name;
         int try_run = 0;
@@ -331,7 +446,7 @@ static void shell_execute(const char *input)
         if (str_starts_with(target, "./")) {
             target = target + 2;
             try_run = 1;
-        } else if (str_has_suffix(target, ".lcbat")) {
+        } else if (path_is_batch_script(target)) {
             try_run = 1;
         }
 
@@ -356,6 +471,64 @@ static void shell_execute(const char *input)
         } else {
             os_term_puts("Unknown command: ", OS_ATTR_MUTED);
             os_term_puts(command_name, OS_ATTR_MUTED);
+        }
+    }
+}
+
+static void shell_execute(const char *input)
+{
+    char stage[INPUT_MAX + 1];
+    char captured[4096];
+    uint32_t i = 0;
+    uint32_t stage_len = 0;
+    int has_pipe = 0;
+
+    while (input[i]) {
+        if (input[i] == '|') {
+            has_pipe = 1;
+            break;
+        }
+        i++;
+    }
+
+    if (!has_pipe) {
+        os_pipe_input_set("");
+        shell_execute_simple(input);
+        return;
+    }
+
+    i = 0;
+    os_pipe_input_set("");
+    while (1) {
+        int stage_is_last = 1;
+        stage_len = 0;
+
+        while (input[i]) {
+            if (input[i] == '|') {
+                stage_is_last = 0;
+                i++;
+                break;
+            }
+            if (stage_len < INPUT_MAX)
+                stage[stage_len++] = input[i];
+            i++;
+        }
+        stage[stage_len] = '\0';
+
+        while (stage_len > 0 && char_is_space(stage[stage_len - 1])) {
+            stage_len--;
+            stage[stage_len] = '\0';
+        }
+
+        if (!stage_is_last) {
+            os_term_capture_begin();
+            shell_execute_simple(stage);
+            os_term_capture_end(captured, sizeof(captured));
+            os_pipe_input_set(captured);
+        } else {
+            shell_execute_simple(stage);
+            os_pipe_input_set("");
+            break;
         }
     }
 }
@@ -415,6 +588,10 @@ void shell_handle_event(const struct key_event *event)
         shell_insert_char(event->ch);
         break;
     case KEY_CTRL_C:
+        os_term_puts("^C", 0x07);
+        os_term_newline();
+        shell_input_reset();
+        os_redraw_input_line();
         break;
     case KEY_ENTER:
         shell_submit();
@@ -444,6 +621,11 @@ void shell_handle_event(const struct key_event *event)
     }
 }
 
+void shell_run_line(const char *input)
+{
+    shell_execute(input);
+}
+
 const char *shell_current_dir(void)
 {
     return shell_current_dir_buffer;
@@ -471,5 +653,5 @@ char shell_input_char_at(uint32_t index)
 
 uint32_t shell_prompt_length(void)
 {
-    return str_len(shell_current_dir_buffer) + 3;
+    return str_len(shell_current_dir_buffer) + 2;
 }

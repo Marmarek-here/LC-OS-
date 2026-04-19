@@ -1,0 +1,10 @@
+# LC(OS) batch script example
+# Lines starting with # or ; are comments
+
+echo Running demo script...
+ls
+mkdir demo_dir
+touch demo_dir/note.txt
+echo Hello from LC(OS) > demo_dir/note.txt
+read demo_dir/note.txt
+run snake
