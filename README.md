@@ -11,7 +11,7 @@
 ### LC(OS).
 LC(OS) is a tiny OS that is made for fun, learning* and exploring**.   
 *The project is made by AI, I didn't code the OS' parts. Sorry about that.   
-**I do not look at the code.   
+**I do not look at the code. It's welcome, however, to point out the things I need to correct and may make a Pull Request.   
 
 ### Dependencies required to build.
 - GCC (i386-elf-gcc)
@@ -35,3 +35,7 @@ Pull requests are welcome as the project is being developed.
 You are allowed to redistribute the project with GPL's rules.   
 
 ### Thank you.
+***The code, however, was compiled and ran. It's functional.***
+
+
+
