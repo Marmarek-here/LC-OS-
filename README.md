@@ -28,7 +28,7 @@ LC(OS) is a tiny OS that is made for fun, learning* and exploring**.
 
 ### How to build.
 - Open a terminal/cmd.
-- run 'git pull https://github.com/Marmarek-here/LC-OS-' and optionally add ' [folder name you want it to be in]'
+- run 'git clone https://github.com/Marmarek-here/LC-OS-' and optionally add ' [folder name you want it to be in]'
 - Navigate to the folder you have the source code in.
 - Through GUI (a file explorer) or command prompt, create a folder called 'kernel'.
 - Put everything into 'kernel'.
