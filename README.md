@@ -47,4 +47,4 @@ However, you are not allowed what you are not allowed in the license.
 Pull requests are welcome as the project is being developed.   
 You are allowed to redistribute the project with MIT's rules.   
 
-### The system builds and runs successfully.***
+### The system builds and runs successfully.
