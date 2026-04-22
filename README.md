@@ -27,6 +27,7 @@ LC(OS) is a tiny OS that is made for fun, learning* and exploring**.
 - KVM/HAXM/WHPX (KVM for Linux, others for Windows)
 
 ### How to build.
+- Make sure you have all the dependencies installed.
 - Open a terminal/cmd.
 - run 'git clone https://github.com/Marmarek-here/LC-OS-' and optionally add ' [folder name you want it to be in]'
 - Navigate to the folder you have the source code in.
@@ -36,7 +37,7 @@ LC(OS) is a tiny OS that is made for fun, learning* and exploring**.
 - Run 'make iso' inside the kernel folder
 
 ### How to run
-- Run qemu-system-x86_64 -cdrom lcos.iso (or, if from the source code, kernel/lcos.iso) (add additonal flags to the command if you will to do so) in 'kernel' folder or in the source code folder.
+- Run qemu-system-x86_64 -cdrom lcos.iso (or, if from the source code folder, kernel/lcos.iso) (add additonal flags to the command if you will to do so) in 'kernel' folder.
 - Now it booted (or if it didn't, check if you skipped something).
 
 -Note: i386-elf-gcc and i386-elf-binutils are required. Standard system GCC will likely fail to build the kernel correctly.
