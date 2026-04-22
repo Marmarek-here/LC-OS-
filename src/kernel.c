@@ -6,9 +6,11 @@
 
 #include "commands/builtin_commands.h"
 #include "games.h"
+#include "gdt.h"
 #include "os_api.h"
 #include "programs/program_registry.h"
 #include "reboot_state.h"
+#include "scheduler.h"
 #include "shell.h"
 #include "types.h"
 #include "vga.h"
@@ -32,6 +34,10 @@
 #define MULTIBOOT2_BOOTLOADER_MAGIC 0x36D76289
 #define MULTIBOOT2_TAG_TYPE_END          0
 #define MULTIBOOT2_TAG_TYPE_MODULE        3
+#define MULTIBOOT2_TAG_TYPE_MMAP          6
+#define MULTIBOOT2_TAG_TYPE_VBE           7
+#define MULTIBOOT2_TAG_TYPE_EFI32         11
+#define MULTIBOOT2_TAG_TYPE_EFI64         12
 #define MULTIBOOT2_TAG_TYPE_FRAMEBUFFER   8
 
 #define VGA_CRTC_INDEX     0x3D4
@@ -52,6 +58,14 @@ static uint32_t cursor_saved_row = 11;
 static uint32_t cursor_saved_col = PROMPT_SIZE;
 static uint32_t cursor_blink_ticks = 0;
 static int cpu_x86_64_capable = 0;
+static int cpu_real_mode_compatible = 1;
+static int video_vbe_available = 0;
+static int booted_via_uefi = 0;
+static uint32_t boot_usable_region_base = 0;
+static uint32_t boot_usable_region_size = 0;
+static uint32_t boot_usable_ram_kib = 0;
+static uint32_t boot_reserved_ram_kib = 0;
+static uint32_t boot_acpi_ram_kib = 0;
 
 static const uint8_t *fat12_image = 0;
 static uint32_t fat12_image_size = 0;
@@ -70,34 +84,33 @@ struct InMemFile {
 static struct InMemFile in_memory_files[MAX_FILES];
 static uint32_t file_count = 0;
 
-#define FS_PERSIST_MAGIC0  'L'
-#define FS_PERSIST_MAGIC1  'C'
-#define FS_PERSIST_MAGIC2  'O'
-#define FS_PERSIST_MAGIC3  'S'
-#define FS_PERSIST_MAGIC4  'P'
-#define FS_PERSIST_MAGIC5  'F'
-#define FS_PERSIST_MAGIC6  'S'
-#define FS_PERSIST_MAGIC7  '1'
-#define FS_PERSIST_VERSION 1u
+#define LCFS_MAGIC0        'L'
+#define LCFS_MAGIC1        'C'
+#define LCFS_MAGIC2        'F'
+#define LCFS_MAGIC3        'S'
+#define LCFS_MAGIC4        'V'
+#define LCFS_MAGIC5        '0'
+#define LCFS_MAGIC6        '1'
+#define LCFS_MAGIC7        '\0'
+#define LCFS_VERSION       1u
+#define LCFS_REC_DIR       1u
+#define LCFS_REC_FILE      2u
 #define FS_PERSIST_SECTORS 96u
+#define FS_PERSIST_BYTES   (FS_PERSIST_SECTORS * 512u)
 
-struct persist_file_entry {
-    char path[INPUT_MAX + 1];
-    uint32_t content_len;
-    char content[256];
-};
-
-struct persist_state {
+struct lcfs_header {
     uint8_t magic[8];
     uint32_t version;
+    uint32_t total_size;
     uint32_t dir_count;
     uint32_t file_count;
-    char directories[MAX_DIRS][INPUT_MAX + 1];
-    struct persist_file_entry files[MAX_FILES];
+    uint32_t checksum;
 };
 
 static int fs_persist_enabled = 0;
 static int fs_persist_ready = 0;
+static int fs_persist_faulted = 0;
+static uint8_t fs_persist_bytes[FS_PERSIST_BYTES];
 
 #define IDT_ENTRIES        256
 #define PIC1_CMD           0x20
@@ -111,9 +124,16 @@ static volatile struct key_event kb_queue[KB_EVENT_QUEUE_SZ];
 static volatile uint32_t kb_head = 0;
 static volatile uint32_t kb_tail = 0;
 
-static volatile uint32_t scheduler_ticks = 0;
-static volatile uint32_t scheduler_current_task = 0;
-static volatile uint32_t scheduler_task_count = 1;
+static volatile int mouse_x = 0;
+static volatile int mouse_y = 0;
+static volatile uint8_t mouse_buttons = 0;
+static volatile uint8_t mouse_prev_buttons = 0;
+static volatile uint8_t mouse_packet[3];
+static volatile uint32_t mouse_packet_index = 0;
+static volatile int mouse_left_click_pending = 0;
+static volatile int mouse_click_x = 0;
+static volatile int mouse_click_y = 0;
+
 static char pipe_input_buffer[2048];
 static int term_capture_active = 0;
 static char term_capture_buffer[4096];
@@ -161,6 +181,22 @@ struct multiboot2_tag_framebuffer {
     uint16_t reserved;
 } __attribute__((packed));
 
+struct multiboot2_tag_mmap {
+    uint32_t type;
+    uint32_t size;
+    uint32_t entry_size;
+    uint32_t entry_version;
+} __attribute__((packed));
+
+struct multiboot2_mmap_entry {
+    uint32_t addr_lo;
+    uint32_t addr_hi;
+    uint32_t len_lo;
+    uint32_t len_hi;
+    uint32_t type;
+    uint32_t reserved;
+} __attribute__((packed));
+
 struct fat12_context {
     uint16_t bytes_per_sector;
     uint8_t sectors_per_cluster;
@@ -170,8 +206,12 @@ struct fat12_context {
     uint16_t sectors_per_fat;
     uint32_t total_sectors;
     uint32_t root_dir_sectors;
+    uint32_t data_sectors;
+    uint32_t cluster_count;
     uint32_t first_root_sector;
     uint32_t first_data_sector;
+    uint8_t fat_type;
+    uint16_t eoc_marker;
 };
 
 struct fat12_entry {
@@ -187,6 +227,7 @@ extern void (*exception_stub_table[])(void);
 extern void interrupt_ignore_stub(void);
 extern void irq0_stub(void);
 extern void irq1_stub(void);
+extern void irq12_stub(void);
 
 static struct key_event keyboard_decode(uint8_t raw_scancode);
 static void keyboard_event_push(struct key_event event);
@@ -239,9 +280,107 @@ static inline void io_wait(void)
     __asm__ volatile ("outb %%al, $0x80" : : "a"(0));
 }
 
+static int ps2_wait_can_write(void)
+{
+    uint32_t timeout = 100000u;
+    while (timeout--) {
+        if ((inb(PS2_STATUS_PORT) & 0x02u) == 0u)
+            return 1;
+    }
+    return 0;
+}
+
+static int ps2_wait_can_read(void)
+{
+    uint32_t timeout = 100000u;
+    while (timeout--) {
+        if (inb(PS2_STATUS_PORT) & 0x01u)
+            return 1;
+    }
+    return 0;
+}
+
+static int ps2_mouse_write(uint8_t value)
+{
+    if (!ps2_wait_can_write())
+        return 0;
+    outb(PS2_STATUS_PORT, 0xD4u);
+    if (!ps2_wait_can_write())
+        return 0;
+    outb(PS2_DATA_PORT, value);
+    return 1;
+}
+
+static int ps2_mouse_read_ack(void)
+{
+    uint8_t data;
+    if (!ps2_wait_can_read())
+        return 0;
+    data = inb(PS2_DATA_PORT);
+    return data == 0xFAu;
+}
+
+static int mouse_apply_sensitivity(int delta)
+{
+    if (delta > 0)
+        return (delta + 1) / 2;
+    if (delta < 0)
+        return (delta - 1) / 2;
+    return 0;
+}
+
+static void mouse_init(void)
+{
+    uint8_t status;
+    uint32_t cols = vga_is_framebuffer() ? vga_fb_width() : vga_cols();
+    uint32_t rows = vga_is_framebuffer() ? vga_fb_height() : vga_rows();
+
+    if (cols == 0)
+        cols = 80;
+    if (rows == 0)
+        rows = 25;
+
+    mouse_x = (int)(cols / 2u);
+    mouse_y = (int)(rows / 2u);
+    mouse_buttons = 0;
+    mouse_prev_buttons = 0;
+    mouse_packet_index = 0;
+    mouse_left_click_pending = 0;
+
+    if (!ps2_wait_can_write())
+        return;
+    outb(PS2_STATUS_PORT, 0xA8u);
+
+    if (!ps2_wait_can_write())
+        return;
+    outb(PS2_STATUS_PORT, 0x20u);
+    if (!ps2_wait_can_read())
+        return;
+    status = inb(PS2_DATA_PORT);
+
+    status |= 0x02u;
+    status &= (uint8_t)~0x20u;
+
+    if (!ps2_wait_can_write())
+        return;
+    outb(PS2_STATUS_PORT, 0x60u);
+    if (!ps2_wait_can_write())
+        return;
+    outb(PS2_DATA_PORT, status);
+
+    if (!ps2_mouse_write(0xF6u))
+        return;
+    if (!ps2_mouse_read_ack())
+        return;
+
+    if (!ps2_mouse_write(0xF4u))
+        return;
+    ps2_mouse_read_ack();
+}
+
 static int ata_wait_not_busy(uint16_t io_base)
 {
-    uint32_t timeout = 1000000u;
+    uint32_t timeout = 200000u;
     while (timeout--) {
         uint8_t status = inb((uint16_t)(io_base + 7));
         if ((status & 0x80u) == 0)
@@ -252,7 +391,7 @@ static int ata_wait_not_busy(uint16_t io_base)
 
 static int ata_wait_drq(uint16_t io_base)
 {
-    uint32_t timeout = 1000000u;
+    uint32_t timeout = 200000u;
     while (timeout--) {
         uint8_t status = inb((uint16_t)(io_base + 7));
         if (status & 0x01u)
@@ -359,10 +498,10 @@ static int ata_identify_total_sectors(uint32_t *total)
 
 static int fs_persist_magic_ok(const uint8_t *m)
 {
-    return m[0] == FS_PERSIST_MAGIC0 && m[1] == FS_PERSIST_MAGIC1 &&
-           m[2] == FS_PERSIST_MAGIC2 && m[3] == FS_PERSIST_MAGIC3 &&
-           m[4] == FS_PERSIST_MAGIC4 && m[5] == FS_PERSIST_MAGIC5 &&
-           m[6] == FS_PERSIST_MAGIC6 && m[7] == FS_PERSIST_MAGIC7;
+    return m[0] == LCFS_MAGIC0 && m[1] == LCFS_MAGIC1 &&
+           m[2] == LCFS_MAGIC2 && m[3] == LCFS_MAGIC3 &&
+           m[4] == LCFS_MAGIC4 && m[5] == LCFS_MAGIC5 &&
+           m[6] == LCFS_MAGIC6 && m[7] == LCFS_MAGIC7;
 }
 
 static int fs_persist_region_is_zero(const uint8_t *blk)
@@ -375,14 +514,48 @@ static int fs_persist_region_is_zero(const uint8_t *blk)
     return 1;
 }
 
-static int fs_persist_read_state(struct persist_state *state)
+static void lcfs_write_u16(uint8_t *dst, uint16_t value)
+{
+    dst[0] = (uint8_t)(value & 0xFFu);
+    dst[1] = (uint8_t)((value >> 8) & 0xFFu);
+}
+
+static uint16_t lcfs_read_u16(const uint8_t *src)
+{
+    return (uint16_t)src[0] | (uint16_t)((uint16_t)src[1] << 8);
+}
+
+static void lcfs_write_u32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)(value & 0xFFu);
+    dst[1] = (uint8_t)((value >> 8) & 0xFFu);
+    dst[2] = (uint8_t)((value >> 16) & 0xFFu);
+    dst[3] = (uint8_t)((value >> 24) & 0xFFu);
+}
+
+static uint32_t lcfs_read_u32(const uint8_t *src)
+{
+    return (uint32_t)src[0] |
+           ((uint32_t)src[1] << 8) |
+           ((uint32_t)src[2] << 16) |
+           ((uint32_t)src[3] << 24);
+}
+
+static uint32_t lcfs_checksum(const uint8_t *bytes, uint32_t size)
+{
+    uint32_t sum = 0;
+    uint32_t i;
+    for (i = 0; i < size; i++)
+        sum = (sum << 5) - sum + (uint32_t)bytes[i];
+    return sum;
+}
+
+static int fs_persist_read_bytes(uint8_t *dst)
 {
     uint32_t total;
     uint32_t start_lba;
     uint32_t i;
-    uint8_t *dst = (uint8_t *)state;
     uint8_t first[512];
-    uint32_t need;
 
     if (!ata_identify_total_sectors(&total))
         return 0;
@@ -400,35 +573,27 @@ static int fs_persist_read_state(struct persist_state *state)
         return 1;
     }
 
-    need = (uint32_t)sizeof(struct persist_state);
-    for (i = 0; i < FS_PERSIST_SECTORS && need > 0u; i++) {
-        uint8_t blk[512];
-        uint32_t copy = need > 512u ? 512u : need;
+    for (i = 0; i < FS_PERSIST_SECTORS; i++) {
         uint32_t j;
-
+        uint8_t blk[512];
         if (!ata_pio_read_sector(start_lba + i, blk))
             return 0;
-        for (j = 0; j < copy; j++)
+        for (j = 0; j < 512u; j++)
             dst[i * 512u + j] = blk[j];
-        need -= copy;
     }
-
-    if (!fs_persist_magic_ok(state->magic) || state->version != FS_PERSIST_VERSION)
-        return 0;
 
     fs_persist_enabled = 1;
     return 1;
 }
 
-static int fs_persist_write_state(const struct persist_state *state)
+static int fs_persist_write_bytes(const uint8_t *src)
 {
     uint32_t total;
     uint32_t start_lba;
     uint32_t i;
-    const uint8_t *src = (const uint8_t *)state;
-    uint32_t need;
+    uint32_t j;
 
-    if (!fs_persist_enabled)
+    if (!fs_persist_enabled || fs_persist_faulted)
         return 0;
 
     if (!ata_identify_total_sectors(&total))
@@ -437,98 +602,227 @@ static int fs_persist_write_state(const struct persist_state *state)
         return 0;
 
     start_lba = total - FS_PERSIST_SECTORS;
-    need = (uint32_t)sizeof(struct persist_state);
 
     for (i = 0; i < FS_PERSIST_SECTORS; i++) {
         uint8_t blk[512];
-        uint32_t copy = need > 512u ? 512u : need;
-        uint32_t j;
-
         for (j = 0; j < 512u; j++)
-            blk[j] = 0u;
+            blk[j] = src[i * 512u + j];
+        if (!ata_pio_write_sector(start_lba + i, blk)) {
+            fs_persist_faulted = 1;
+            return 0;
+        }
+    }
 
-        if (copy > 0u) {
-            for (j = 0; j < copy; j++)
-                blk[j] = src[i * 512u + j];
-            need -= copy;
+    return 1;
+}
+
+static int lcfs_serialize(uint8_t *out, uint32_t out_cap)
+{
+    struct lcfs_header hdr;
+    uint32_t off = (uint32_t)sizeof(struct lcfs_header);
+    uint32_t i;
+    uint32_t j;
+
+    if (out_cap < sizeof(struct lcfs_header))
+        return 0;
+
+    for (i = 0; i < out_cap; i++)
+        out[i] = 0u;
+
+    hdr.magic[0] = LCFS_MAGIC0;
+    hdr.magic[1] = LCFS_MAGIC1;
+    hdr.magic[2] = LCFS_MAGIC2;
+    hdr.magic[3] = LCFS_MAGIC3;
+    hdr.magic[4] = LCFS_MAGIC4;
+    hdr.magic[5] = LCFS_MAGIC5;
+    hdr.magic[6] = LCFS_MAGIC6;
+    hdr.magic[7] = LCFS_MAGIC7;
+    hdr.version = LCFS_VERSION;
+    hdr.total_size = (uint32_t)sizeof(struct lcfs_header);
+    hdr.dir_count = dir_count;
+    hdr.file_count = file_count;
+    hdr.checksum = 0u;
+
+    for (i = 0; i < dir_count && i < MAX_DIRS; i++) {
+        uint32_t path_len = 0;
+        while (directories[i][path_len] && path_len < INPUT_MAX)
+            path_len++;
+
+        if (off + 2u + path_len > out_cap)
+            return 0;
+
+        out[off++] = (uint8_t)LCFS_REC_DIR;
+        out[off++] = (uint8_t)path_len;
+        for (j = 0; j < path_len; j++)
+            out[off++] = (uint8_t)directories[i][j];
+    }
+
+    for (i = 0; i < file_count && i < MAX_FILES; i++) {
+        uint32_t path_len = 0;
+        uint32_t content_len = in_memory_files[i].content_len;
+
+        while (in_memory_files[i].path[path_len] && path_len < INPUT_MAX)
+            path_len++;
+        if (content_len > sizeof(in_memory_files[i].content))
+            content_len = sizeof(in_memory_files[i].content);
+
+        if (off + 4u + path_len + content_len > out_cap)
+            return 0;
+
+        out[off++] = (uint8_t)LCFS_REC_FILE;
+        out[off++] = (uint8_t)path_len;
+        for (j = 0; j < path_len; j++)
+            out[off++] = (uint8_t)in_memory_files[i].path[j];
+        lcfs_write_u16(&out[off], (uint16_t)content_len);
+        off += 2u;
+        for (j = 0; j < content_len; j++)
+            out[off++] = (uint8_t)in_memory_files[i].content[j];
+    }
+
+    hdr.total_size = off;
+    hdr.checksum = lcfs_checksum(out + sizeof(struct lcfs_header), off - (uint32_t)sizeof(struct lcfs_header));
+
+    for (i = 0; i < 8u; i++)
+        out[i] = hdr.magic[i];
+    lcfs_write_u32(out + 8u, hdr.version);
+    lcfs_write_u32(out + 12u, hdr.total_size);
+    lcfs_write_u32(out + 16u, hdr.dir_count);
+    lcfs_write_u32(out + 20u, hdr.file_count);
+    lcfs_write_u32(out + 24u, hdr.checksum);
+
+    return 1;
+}
+
+static int lcfs_deserialize(const uint8_t *in, uint32_t in_size)
+{
+    uint32_t off = (uint32_t)sizeof(struct lcfs_header);
+    uint32_t total_size;
+    uint32_t dir_target;
+    uint32_t file_target;
+    uint32_t checksum_stored;
+    uint32_t checksum_calc;
+
+    if (in_size < sizeof(struct lcfs_header))
+        return 0;
+    if (!fs_persist_magic_ok(in))
+        return 0;
+
+    if (lcfs_read_u32(in + 8u) != LCFS_VERSION)
+        return 0;
+
+    total_size = lcfs_read_u32(in + 12u);
+    dir_target = lcfs_read_u32(in + 16u);
+    file_target = lcfs_read_u32(in + 20u);
+    checksum_stored = lcfs_read_u32(in + 24u);
+
+    if (total_size < sizeof(struct lcfs_header) || total_size > in_size)
+        return 0;
+
+    checksum_calc = lcfs_checksum(in + sizeof(struct lcfs_header), total_size - (uint32_t)sizeof(struct lcfs_header));
+    if (checksum_calc != checksum_stored)
+        return 0;
+
+    dir_count = 0;
+    file_count = 0;
+
+    while (off < total_size) {
+        uint8_t rec_type;
+        uint8_t path_len;
+        uint32_t path_len_u32;
+        uint32_t i;
+
+        if (off + 2u > total_size)
+            return 0;
+
+        rec_type = in[off++];
+        path_len = in[off++];
+        path_len_u32 = (uint32_t)path_len;
+
+        if (path_len_u32 > INPUT_MAX)
+            return 0;
+
+        if (rec_type == LCFS_REC_DIR) {
+            if (off + path_len_u32 > total_size)
+                return 0;
+            if (dir_count >= MAX_DIRS)
+                return 0;
+            for (i = 0; i < path_len_u32; i++)
+                directories[dir_count][i] = (char)in[off + i];
+            directories[dir_count][path_len_u32] = '\0';
+            off += path_len_u32;
+            dir_count++;
+            continue;
         }
 
-        if (!ata_pio_write_sector(start_lba + i, blk))
-            return 0;
+        if (rec_type == LCFS_REC_FILE) {
+            uint16_t content_len;
+            if (off + path_len_u32 + 2u > total_size)
+                return 0;
+            if (file_count >= MAX_FILES)
+                return 0;
+            for (i = 0; i < path_len_u32; i++)
+                in_memory_files[file_count].path[i] = (char)in[off + i];
+            in_memory_files[file_count].path[path_len_u32] = '\0';
+            off += path_len_u32;
+
+            content_len = lcfs_read_u16(in + off);
+            off += 2u;
+
+            if ((uint32_t)content_len + off > total_size)
+                return 0;
+            if (content_len >= sizeof(in_memory_files[file_count].content))
+                content_len = (uint16_t)(sizeof(in_memory_files[file_count].content) - 1u);
+
+            for (i = 0; i < (uint32_t)content_len; i++)
+                in_memory_files[file_count].content[i] = (char)in[off + i];
+            in_memory_files[file_count].content[content_len] = '\0';
+            in_memory_files[file_count].content_len = (uint32_t)content_len;
+            off += lcfs_read_u16(in + off - 2u);
+            file_count++;
+            continue;
+        }
+
+        return 0;
     }
+
+    if (dir_count != dir_target || file_count != file_target)
+        return 0;
 
     return 1;
 }
 
 static void fs_persist_save_current(void)
 {
-    struct persist_state state;
-    uint32_t i;
-    uint32_t j;
-
-    if (fs_persist_ready == 0)
+    if (fs_persist_ready == 0 || fs_persist_faulted)
         return;
 
-    for (i = 0; i < sizeof(struct persist_state); i++)
-        ((uint8_t *)&state)[i] = 0u;
-
-    state.magic[0] = FS_PERSIST_MAGIC0;
-    state.magic[1] = FS_PERSIST_MAGIC1;
-    state.magic[2] = FS_PERSIST_MAGIC2;
-    state.magic[3] = FS_PERSIST_MAGIC3;
-    state.magic[4] = FS_PERSIST_MAGIC4;
-    state.magic[5] = FS_PERSIST_MAGIC5;
-    state.magic[6] = FS_PERSIST_MAGIC6;
-    state.magic[7] = FS_PERSIST_MAGIC7;
-    state.version = FS_PERSIST_VERSION;
-    state.dir_count = dir_count;
-    state.file_count = file_count;
-
-    for (i = 0; i < dir_count && i < MAX_DIRS; i++) {
-        for (j = 0; directories[i][j] && j < INPUT_MAX; j++)
-            state.directories[i][j] = directories[i][j];
-        state.directories[i][j] = '\0';
+    if (!lcfs_serialize(fs_persist_bytes, FS_PERSIST_BYTES)) {
+        fs_persist_faulted = 1;
+        return;
     }
 
-    for (i = 0; i < file_count && i < MAX_FILES; i++) {
-        for (j = 0; in_memory_files[i].path[j] && j < INPUT_MAX; j++)
-            state.files[i].path[j] = in_memory_files[i].path[j];
-        state.files[i].path[j] = '\0';
-        state.files[i].content_len = in_memory_files[i].content_len;
-        for (j = 0; j < in_memory_files[i].content_len && j < sizeof(state.files[i].content); j++)
-            state.files[i].content[j] = in_memory_files[i].content[j];
-    }
-
-    fs_persist_write_state(&state);
+    fs_persist_write_bytes(fs_persist_bytes);
 }
 
 static void fs_persist_load_current(void)
 {
-    struct persist_state state;
     uint32_t i;
 
     dir_count = 0;
     file_count = 0;
+    for (i = 0; i < MAX_DIRS; i++)
+        directories[i][0] = '\0';
+    for (i = 0; i < MAX_FILES; i++) {
+        in_memory_files[i].path[0] = '\0';
+        in_memory_files[i].content[0] = '\0';
+        in_memory_files[i].content_len = 0;
+    }
 
-    if (fs_persist_read_state(&state)) {
-        if (state.dir_count <= MAX_DIRS)
-            dir_count = state.dir_count;
-        if (state.file_count <= MAX_FILES)
-            file_count = state.file_count;
-
-        for (i = 0; i < dir_count; i++)
-            str_copy(directories[i], state.directories[i]);
-
-        for (i = 0; i < file_count; i++) {
-            str_copy(in_memory_files[i].path, state.files[i].path);
-            in_memory_files[i].content_len = state.files[i].content_len;
-            if (in_memory_files[i].content_len > sizeof(in_memory_files[i].content) - 1)
-                in_memory_files[i].content_len = sizeof(in_memory_files[i].content) - 1;
-            {
-                uint32_t j;
-                for (j = 0; j < in_memory_files[i].content_len; j++)
-                    in_memory_files[i].content[j] = state.files[i].content[j];
-                in_memory_files[i].content[in_memory_files[i].content_len] = '\0';
+    if (fs_persist_read_bytes(fs_persist_bytes)) {
+        if (fs_persist_magic_ok(fs_persist_bytes)) {
+            if (!lcfs_deserialize(fs_persist_bytes, FS_PERSIST_BYTES)) {
+                dir_count = 0;
+                file_count = 0;
             }
         }
     }
@@ -566,9 +860,13 @@ static void init_layout(void)
 {
     uint32_t rows = term_rows();
 
-    if (rows >= 14) {
-        ui_status_row = 9;
-        term_top_row = 10;
+    if (rows >= 18) {
+        /* Keep logo visible while giving the shell a larger viewport. */
+        ui_status_row = 6;
+        term_top_row = 7;
+    } else if (rows >= 12) {
+        ui_status_row = 4;
+        term_top_row = 5;
     } else if (rows >= 6) {
         ui_status_row = rows - 4;
         term_top_row = rows - 3;
@@ -606,31 +904,6 @@ static int cpu_has_long_mode(void)
 
     cpuid(0x80000001u, &eax, &ebx, &ecx, &edx);
     return (edx & (1u << 29)) != 0;
-}
-
-static void scheduler_tick(void)
-{
-    scheduler_ticks++;
-    if (scheduler_task_count > 1)
-        scheduler_current_task = (scheduler_current_task + 1) % scheduler_task_count;
-}
-
-static void scheduler_init(void)
-{
-    scheduler_ticks = 0;
-    scheduler_current_task = 0;
-    scheduler_task_count = 2;
-}
-
-static void scheduler_refresh_tasks(void)
-{
-    scheduler_task_count = 2;
-    if (games_editor_is_active())
-        scheduler_task_count++;
-    if (games_is_active())
-        scheduler_task_count++;
-    if (scheduler_current_task >= scheduler_task_count)
-        scheduler_current_task = 0;
 }
 
 static void paging_init(void)
@@ -704,6 +977,7 @@ static void interrupts_init(void)
 
     idt_set_gate(0x20, (uint32_t)irq0_stub, code_selector, 0x8E);
     idt_set_gate(0x21, (uint32_t)irq1_stub, code_selector, 0x8E);
+    idt_set_gate(0x2C, (uint32_t)irq12_stub, code_selector, 0x8E);
 
     idtp.limit = (uint16_t)(sizeof(idt) - 1);
     idtp.base = (uint32_t)idt;
@@ -711,9 +985,9 @@ static void interrupts_init(void)
     __asm__ volatile ("lidt %0" : : "m"(idtp));
 
     pic_remap();
-    /* Unmask IRQ0 (timer) and IRQ1 (keyboard); mask others. */
-    outb(PIC1_DATA, 0xFC);
-    outb(PIC2_DATA, 0xFF);
+    /* Unmask IRQ0, IRQ1, IRQ2(cascade) and IRQ12(mouse). */
+    outb(PIC1_DATA, 0xF8);
+    outb(PIC2_DATA, 0xEF);
 }
 
 void irq0_handler_c(void)
@@ -730,6 +1004,53 @@ void irq1_handler_c(void)
     if (event.type != KEY_NONE)
         keyboard_event_push(event);
 
+    outb(PIC1_CMD, PIC_EOI);
+}
+
+void irq12_handler_c(void)
+{
+    uint8_t data = inb(PS2_DATA_PORT);
+
+    if (mouse_packet_index == 0 && (data & 0x08u) == 0u) {
+        outb(PIC2_CMD, PIC_EOI);
+        outb(PIC1_CMD, PIC_EOI);
+        return;
+    }
+
+    mouse_packet[mouse_packet_index++] = data;
+
+    if (mouse_packet_index == 3u) {
+        int dx = mouse_apply_sensitivity((int)((signed char)mouse_packet[1]));
+        int dy = mouse_apply_sensitivity((int)((signed char)mouse_packet[2]));
+        uint8_t buttons = (uint8_t)(mouse_packet[0] & 0x07u);
+        int max_x = (int)(vga_is_framebuffer() ? vga_fb_width() : term_cols()) - 1;
+        int max_y = (int)(vga_is_framebuffer() ? vga_fb_height() : term_rows()) - 1;
+
+        mouse_packet_index = 0;
+
+        mouse_x += dx;
+        mouse_y -= dy;
+
+        if (mouse_x < 0)
+            mouse_x = 0;
+        if (mouse_y < 0)
+            mouse_y = 0;
+        if (mouse_x > max_x)
+            mouse_x = max_x;
+        if (mouse_y > max_y)
+            mouse_y = max_y;
+
+        if ((buttons & 0x01u) != 0u && (mouse_prev_buttons & 0x01u) == 0u) {
+            mouse_left_click_pending = 1;
+            mouse_click_x = mouse_x;
+            mouse_click_y = mouse_y;
+        }
+
+        mouse_buttons = buttons;
+        mouse_prev_buttons = buttons;
+    }
+
+    outb(PIC2_CMD, PIC_EOI);
     outb(PIC1_CMD, PIC_EOI);
 }
 
@@ -1181,12 +1502,12 @@ static void draw_logo(void)
 
 static void draw_splash_screen(void)
 {
-    uint32_t start_tick = scheduler_ticks;
+    uint32_t start_tick = scheduler_ticks_get();
     vga_clear();
     draw_logo();
     vga_puts_at("LC(OS)", VGA_ATTR_TEXT, term_rows() / 2, 2);
     vga_puts_at("Booting kernel and restoring VFS...", VGA_ATTR_MUTED, term_rows() / 2 + 2, 2);
-    while ((scheduler_ticks - start_tick) < 18u)
+    while ((scheduler_ticks_get() - start_tick) < 18u)
         __asm__ volatile ("hlt");
 }
 
@@ -1384,11 +1705,84 @@ static uint32_t read_u32_le(const uint8_t *ptr)
            ((uint32_t)ptr[3] << 24);
 }
 
+static void boot_memory_init_from_multiboot(uint32_t magic, uint32_t info_addr)
+{
+    const uint8_t *info;
+    uint32_t total_size;
+    uint32_t offset;
+
+    booted_via_uefi = 0;
+    boot_usable_region_base = 0;
+    boot_usable_region_size = 0;
+    boot_usable_ram_kib = 0;
+    boot_reserved_ram_kib = 0;
+    boot_acpi_ram_kib = 0;
+
+    if (magic != MULTIBOOT2_BOOTLOADER_MAGIC || info_addr == 0)
+        return;
+
+    info = (const uint8_t *)info_addr;
+    total_size = read_u32_le(info);
+    if (total_size < 16)
+        return;
+
+    offset = 8;
+    while (offset + 8 <= total_size) {
+        const struct multiboot2_tag *tag = (const struct multiboot2_tag *)(info + offset);
+        uint32_t aligned_size;
+
+        if (tag->type == MULTIBOOT2_TAG_TYPE_END)
+            break;
+        if (tag->size < 8)
+            break;
+
+        if (tag->type == MULTIBOOT2_TAG_TYPE_EFI32 || tag->type == MULTIBOOT2_TAG_TYPE_EFI64)
+            booted_via_uefi = 1;
+
+        if (tag->type == MULTIBOOT2_TAG_TYPE_MMAP) {
+            const struct multiboot2_tag_mmap *mmap_tag = (const struct multiboot2_tag_mmap *)tag;
+            uint32_t pos = 16;
+
+            if (mmap_tag->entry_size < sizeof(struct multiboot2_mmap_entry))
+                goto next_tag;
+
+            while (pos + mmap_tag->entry_size <= tag->size) {
+                const struct multiboot2_mmap_entry *entry =
+                    (const struct multiboot2_mmap_entry *)((const uint8_t *)tag + pos);
+                uint32_t len_kib = entry->len_hi ? 0xFFFFFFFFu : (entry->len_lo >> 10);
+
+                if (entry->type == 1u) {
+                    boot_usable_ram_kib += len_kib;
+                    if (entry->addr_hi == 0u && entry->len_hi == 0u &&
+                        entry->addr_lo >= 0x00100000u && entry->len_lo > boot_usable_region_size) {
+                        boot_usable_region_base = entry->addr_lo;
+                        boot_usable_region_size = entry->len_lo;
+                    }
+                } else if (entry->type == 3u || entry->type == 4u) {
+                    boot_acpi_ram_kib += len_kib;
+                } else {
+                    boot_reserved_ram_kib += len_kib;
+                }
+
+                pos += mmap_tag->entry_size;
+            }
+        }
+
+next_tag:
+        aligned_size = (tag->size + 7u) & ~7u;
+        if (aligned_size == 0u || offset > total_size - aligned_size)
+            break;
+        offset += aligned_size;
+    }
+}
+
 static void fb_init_from_multiboot(uint32_t magic, uint32_t info_addr)
 {
     const uint8_t *info;
     uint32_t total_size;
     uint32_t offset;
+
+    video_vbe_available = 0;
 
     if (magic != MULTIBOOT2_BOOTLOADER_MAGIC || info_addr == 0)
         return;
@@ -1409,6 +1803,9 @@ static void fb_init_from_multiboot(uint32_t magic, uint32_t info_addr)
         if (tag->size < 8)
             break;
 
+        if (tag->type == MULTIBOOT2_TAG_TYPE_VBE)
+            video_vbe_available = 1;
+
         if (tag->type == MULTIBOOT2_TAG_TYPE_FRAMEBUFFER) {
             const struct multiboot2_tag_framebuffer *fbt =
                 (const struct multiboot2_tag_framebuffer *)tag;
@@ -1423,6 +1820,7 @@ static void fb_init_from_multiboot(uint32_t magic, uint32_t info_addr)
                     fbt->framebuffer_width,
                     fbt->framebuffer_height,
                     fbt->framebuffer_bpp);
+                video_vbe_available = 1;
             }
             break;
         }
@@ -1484,6 +1882,7 @@ static int fat12_load_context(struct fat12_context *ctx)
 {
     uint16_t total16;
     uint32_t total32;
+    uint32_t data_region_start;
 
     if (fat12_image == 0 || fat12_image_size < 512)
         return 0;
@@ -1507,8 +1906,24 @@ static int fat12_load_context(struct fat12_context *ctx)
 
     ctx->root_dir_sectors =
         (uint32_t)((ctx->root_entry_count * 32u + (ctx->bytes_per_sector - 1u)) / ctx->bytes_per_sector);
-    ctx->first_root_sector = ctx->reserved_sectors + ((uint32_t)ctx->fat_count * ctx->sectors_per_fat);
+    data_region_start = ctx->reserved_sectors + ((uint32_t)ctx->fat_count * ctx->sectors_per_fat);
+    if (ctx->total_sectors <= data_region_start + ctx->root_dir_sectors)
+        return 0;
+
+    ctx->first_root_sector = data_region_start;
     ctx->first_data_sector = ctx->first_root_sector + ctx->root_dir_sectors;
+    ctx->data_sectors = ctx->total_sectors - ctx->first_data_sector;
+    ctx->cluster_count = ctx->data_sectors / ctx->sectors_per_cluster;
+
+    if (ctx->cluster_count < 4085u) {
+        ctx->fat_type = 12u;
+        ctx->eoc_marker = 0x0FF8u;
+    } else if (ctx->cluster_count < 65525u) {
+        ctx->fat_type = 16u;
+        ctx->eoc_marker = 0xFFF8u;
+    } else {
+        return 0;
+    }
 
     return 1;
 }
@@ -1570,23 +1985,40 @@ static int fat12_name_matches(const uint8_t *entry, const char *segment, uint32_
     return 1;
 }
 
+static int fat12_cluster_is_data(const struct fat12_context *ctx, uint16_t cluster)
+{
+    return cluster >= 2u && cluster < ctx->eoc_marker;
+}
+
 static int fat12_next_cluster(const struct fat12_context *ctx, uint16_t cluster, uint16_t *next)
 {
-    uint32_t fat_offset = cluster + (cluster / 2u);
-    uint32_t fat_byte_offset = ((uint32_t)ctx->reserved_sectors * ctx->bytes_per_sector) + fat_offset;
-    uint16_t value;
+    uint32_t fat_base = (uint32_t)ctx->reserved_sectors * ctx->bytes_per_sector;
 
-    if (fat_byte_offset + 1 >= fat12_image_size)
-        return 0;
+    if (ctx->fat_type == 16u) {
+        uint32_t fat_byte_offset = fat_base + ((uint32_t)cluster * 2u);
+        if (fat_byte_offset + 1u >= fat12_image_size)
+            return 0;
+        *next = read_u16_le(&fat12_image[fat_byte_offset]);
+        return 1;
+    }
 
-    value = (uint16_t)(fat12_image[fat_byte_offset] | ((uint16_t)fat12_image[fat_byte_offset + 1] << 8));
-    if (cluster & 1)
-        value >>= 4;
-    else
-        value &= 0x0FFF;
+    {
+        uint32_t fat_offset = cluster + (cluster / 2u);
+        uint32_t fat_byte_offset = fat_base + fat_offset;
+        uint16_t value;
 
-    *next = value;
-    return 1;
+        if (fat_byte_offset + 1u >= fat12_image_size)
+            return 0;
+
+        value = (uint16_t)(fat12_image[fat_byte_offset] | ((uint16_t)fat12_image[fat_byte_offset + 1u] << 8));
+        if (cluster & 1u)
+            value >>= 4;
+        else
+            value &= 0x0FFFu;
+
+        *next = value;
+        return 1;
+    }
 }
 
 static int fat12_find_in_directory(const struct fat12_context *ctx,
@@ -1628,7 +2060,7 @@ static int fat12_find_in_directory(const struct fat12_context *ctx,
         return 0;
     }
 
-    while (dir_cluster >= 2 && dir_cluster < 0xFF8) {
+    while (fat12_cluster_is_data(ctx, dir_cluster)) {
         uint32_t first_sector = ctx->first_data_sector +
                                 ((uint32_t)(dir_cluster - 2u) * ctx->sectors_per_cluster);
         uint32_t sector;
@@ -1736,7 +2168,7 @@ static const char *fat12_get_file_content(const char *path)
         remaining = entry.size;
 
     cluster = entry.first_cluster;
-    while (remaining > 0 && cluster >= 2 && cluster < 0xFF8) {
+    while (remaining > 0 && fat12_cluster_is_data(&ctx, cluster)) {
         uint32_t first_sector = ctx.first_data_sector +
                                 ((uint32_t)(cluster - 2u) * ctx.sectors_per_cluster);
         uint32_t sector;
@@ -1875,27 +2307,40 @@ static struct InMemFile *find_memory_file(const char *filepath)
 static int write_memory_file(const char *filepath, const char *content)
 {
     struct InMemFile *file = find_memory_file(filepath);
-
-    /* Count content length */
     uint32_t content_len = 0;
-    
-    /* Count content length */
-    while (content[content_len] && content_len < 255)
+    uint32_t path_len = 0;
+    uint32_t i;
+
+    if (filepath == 0 || content == 0)
+        return 0;
+
+    while (filepath[path_len] && path_len < INPUT_MAX)
+        path_len++;
+    if (filepath[path_len] != '\0')
+        return 0;
+
+    while (content[content_len] && content_len < (uint32_t)(sizeof(in_memory_files[0].content) - 1))
         content_len++;
-    
+
     if (file) {
-        /* Overwrite existing file */
-        str_copy(file->content, content);
+        for (i = 0; i < content_len; i++)
+            file->content[i] = content[i];
+        file->content[content_len] = '\0';
         file->content_len = content_len;
         return 1;
     }
-    
+
     /* Create new file */
     if (file_count >= MAX_FILES)
         return 0;
-    
-    str_copy(in_memory_files[file_count].path, filepath);
-    str_copy(in_memory_files[file_count].content, content);
+
+    for (i = 0; i < path_len; i++)
+        in_memory_files[file_count].path[i] = filepath[i];
+    in_memory_files[file_count].path[path_len] = '\0';
+
+    for (i = 0; i < content_len; i++)
+        in_memory_files[file_count].content[i] = content[i];
+    in_memory_files[file_count].content[content_len] = '\0';
     in_memory_files[file_count].content_len = content_len;
     file_count++;
     return 1;
@@ -2627,6 +3072,29 @@ const char *os_pipe_input_get(void)
     return pipe_input_buffer;
 }
 
+void os_mouse_get_state(int *x, int *y, uint8_t *buttons)
+{
+    if (x)
+        *x = mouse_x;
+    if (y)
+        *y = mouse_y;
+    if (buttons)
+        *buttons = mouse_buttons;
+}
+
+int os_mouse_consume_left_click(int *x, int *y)
+{
+    if (!mouse_left_click_pending)
+        return 0;
+
+    mouse_left_click_pending = 0;
+    if (x)
+        *x = mouse_click_x;
+    if (y)
+        *y = mouse_click_y;
+    return 1;
+}
+
 int os_fs_resolve_path(const char *arg, char *out)
 {
     return resolve_path(arg, out);
@@ -2822,7 +3290,25 @@ int os_fs_collect_extension_matches(const char *dirpath, const char *ext, char *
 
 int os_fs_write_file(const char *path, const char *content)
 {
+    char parent[INPUT_MAX + 1];
+
+    if (path == 0 || content == 0)
+        return 0;
+    if (path[0] != '/' || path[1] == '\0')
+        return 0;
+    if (str_len(path) > INPUT_MAX)
+        return 0;
     if (path_has_forbidden_name_chars(path))
+        return 0;
+    if (dir_exists(path))
+        return 0;
+
+    get_parent_dir(path, parent);
+    if (!dir_exists(parent))
+        return 0;
+
+    if (path_is_under("/devices", path) || path_is_under("/status", path) ||
+        path_is_under("/dev", path) || path_is_under("/proc", path))
         return 0;
 
     {
@@ -2973,10 +3459,60 @@ void os_power_reboot(void)
 
 const char *os_cpu_arch(void)
 {
-    if (cpu_x86_64_capable)
-        return "CPU: x86_64-capable (kernel mode: i386)";
+    static char info[160];
+    uint32_t pos = 0;
+    const char *cpu_text = cpu_x86_64_capable ?
+        "CPU: x86_64-capable, kernel mode i386" :
+        "CPU: i386-compatible, kernel mode i386";
+    const char *video_text = video_vbe_available ?
+        " | Video: VBE/framebuffer enabled" :
+        " | Video: VBE not detected";
+    const char *real_mode_text = cpu_real_mode_compatible ?
+        " | Real mode: compatible" :
+        " | Real mode: unavailable";
+    const char *boot_mode_text = booted_via_uefi ?
+        " | Boot: UEFI" :
+        " | Boot: BIOS";
 
-    return "CPU: i386-compatible";
+    while (cpu_text[pos] && pos + 1 < sizeof(info)) {
+        info[pos] = cpu_text[pos];
+        pos++;
+    }
+
+    {
+        uint32_t i = 0;
+        while (video_text[i] && pos + 1 < sizeof(info))
+            info[pos++] = video_text[i++];
+    }
+
+    {
+        uint32_t i = 0;
+        while (real_mode_text[i] && pos + 1 < sizeof(info))
+            info[pos++] = real_mode_text[i++];
+    }
+
+    {
+        uint32_t i = 0;
+        while (boot_mode_text[i] && pos + 1 < sizeof(info))
+            info[pos++] = boot_mode_text[i++];
+    }
+
+    if (boot_usable_region_size > 0u) {
+        const char *ram_policy = " | RAM policy: usable-only (reserved/ACPI excluded)";
+        uint32_t i = 0;
+        while (ram_policy[i] && pos + 1 < sizeof(info))
+            info[pos++] = ram_policy[i++];
+    }
+
+    if (vga_is_framebuffer()) {
+        const char *mode = " | Display: linear framebuffer";
+        uint32_t i = 0;
+        while (mode[i] && pos + 1 < sizeof(info))
+            info[pos++] = mode[i++];
+    }
+
+    info[pos] = '\0';
+    return info;
 }
 
 void os_storage_probe(int *ata_legacy,
@@ -3052,17 +3588,17 @@ void os_storage_probe(int *ata_legacy,
 
 uint32_t os_scheduler_ticks(void)
 {
-    return scheduler_ticks;
+    return scheduler_ticks_get();
 }
 
 uint32_t os_scheduler_current_task(void)
 {
-    return scheduler_current_task;
+    return scheduler_current_task_get();
 }
 
 uint32_t os_scheduler_task_count(void)
 {
-    return scheduler_task_count;
+    return scheduler_task_count_get();
 }
 
 const char *os_scheduler_task_name(uint32_t index)
@@ -3308,11 +3844,14 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr)
 
     interrupts_disable();
     scheduler_init();
+    gdt_init();
     cpu_x86_64_capable = cpu_has_long_mode();
     vga_init();
     fb_init_from_multiboot(multiboot_magic, multiboot_info_addr);
+    boot_memory_init_from_multiboot(multiboot_magic, multiboot_info_addr);
     init_layout();
     interrupts_init();
+    mouse_init();
     fat12_init_from_multiboot(multiboot_magic, multiboot_info_addr);
     fs_persist_load_current();
     interrupts_enable();
@@ -3331,6 +3870,7 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr)
         scheduler_refresh_tasks();
 
         if (reboot_take_requested()) {
+            fs_persist_load_current();
             vga_clear();
             draw_logo();
             draw_ui();
@@ -3345,7 +3885,7 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr)
 
         if (event.type == KEY_NONE) {
             if (games_is_active())
-                games_tick(scheduler_ticks);
+                games_tick(scheduler_ticks_get());
             else if (!games_editor_is_active())
                 cursor_tick();
 

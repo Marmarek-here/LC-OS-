@@ -19,6 +19,8 @@ int os_check_ctrl_c(void);
 uint32_t os_term_cols(void);
 void os_pipe_input_set(const char *text);
 const char *os_pipe_input_get(void);
+void os_mouse_get_state(int *x, int *y, uint8_t *buttons);
+int os_mouse_consume_left_click(int *x, int *y);
 
 int os_fs_resolve_path(const char *arg, char *out);
 int os_fs_path_name_is_valid(const char *path);

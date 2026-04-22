@@ -1,6 +1,7 @@
 #include "games.h"
 
 #include "os_api.h"
+#include "shell.h"
 #include "vga.h"
 
 #define ATTR_BG 0x10
@@ -26,7 +27,8 @@ enum game_id {
     GAME_SNAKE,
     GAME_TETRIS,
     GAME_PINGPONG,
-    GAME_EDITOR
+    GAME_EDITOR,
+    GAME_DESKTOP
 };
 
 struct snake_state {
@@ -74,6 +76,24 @@ struct editor_state {
     char status[48];
 };
 
+#define DESKTOP_TERM_LINES 24
+#define DESKTOP_TERM_COLS  160
+#define DESKTOP_INPUT_MAX  128
+#define DESKTOP_MENU_ITEMS 3
+
+struct desktop_state {
+    int menu_visible;
+    int menu_selected;
+    int focus_terminal;
+    int explorer_selected;
+    int mouse_x;
+    int mouse_y;
+    char term_lines[DESKTOP_TERM_LINES][DESKTOP_TERM_COLS + 1];
+    uint32_t term_count;
+    char term_input[DESKTOP_INPUT_MAX + 1];
+    uint32_t term_input_len;
+};
+
 static enum game_id active_game = GAME_NONE;
 static uint32_t last_tick = 0;
 static uint32_t rng_state = 0x12345678u;
@@ -85,9 +105,15 @@ static struct snake_state snake;
 static struct pong_state pong;
 static struct tetris_state tetris;
 static struct editor_state editor;
+static struct desktop_state desktop;
 static int editor_frame_initialized = 0;
 static uint32_t editor_frame_cols = 0;
 static uint32_t editor_frame_rows = 0;
+
+static const char *const desktop_root_entries[] = {
+    "addons", "cmd", "commands", "config", "devices", "docs", "extras", "home",
+    "mounts", "programs", "runtime", "scratch", "startup", "state", "status", "syscmd"
+};
 
 static uint32_t str_len(const char *s)
 {
@@ -106,6 +132,17 @@ static int str_eq(const char *a, const char *b)
         i++;
     }
     return a[i] == b[i];
+}
+
+static int str_starts_with(const char *text, const char *prefix)
+{
+    uint32_t i = 0;
+    while (prefix[i]) {
+        if (text[i] != prefix[i])
+            return 0;
+        i++;
+    }
+    return 1;
 }
 
 static const char *path_basename(const char *path)
@@ -232,11 +269,379 @@ static void game_draw_header(const char *title, uint32_t score)
     put_text(0, 9, score_buf, ATTR_TEXT);
 }
 
+static void desktop_term_push_line(const char *line)
+{
+    uint32_t i;
+    uint32_t dst = desktop.term_count;
+
+    if (desktop.term_count >= DESKTOP_TERM_LINES) {
+        for (i = 1; i < DESKTOP_TERM_LINES; i++)
+            str_copy(desktop.term_lines[i - 1], desktop.term_lines[i]);
+        dst = DESKTOP_TERM_LINES - 1;
+    } else {
+        desktop.term_count++;
+    }
+
+    i = 0;
+    while (line[i] && i < DESKTOP_TERM_COLS) {
+        desktop.term_lines[dst][i] = line[i];
+        i++;
+    }
+    desktop.term_lines[dst][i] = '\0';
+}
+
+static int desktop_find_root_index(const char *name)
+{
+    uint32_t i;
+    for (i = 0; i < (uint32_t)(sizeof(desktop_root_entries) / sizeof(desktop_root_entries[0])); i++) {
+        if (str_eq(name, desktop_root_entries[i]))
+            return (int)i;
+    }
+    return -1;
+}
+
+static void desktop_execute_command(void)
+{
+    char cmd[DESKTOP_INPUT_MAX + 1];
+    char captured[4096];
+    char line[DESKTOP_TERM_COLS + 1];
+    uint32_t i = 0;
+
+    while (desktop.term_input[i] && i < DESKTOP_INPUT_MAX) {
+        cmd[i] = desktop.term_input[i];
+        i++;
+    }
+    cmd[i] = '\0';
+
+    desktop_term_push_line(desktop.term_input_len ? cmd : "");
+
+    if (desktop.term_input_len == 0) {
+        desktop.term_input[0] = '\0';
+        return;
+    }
+
+    if (str_eq(cmd, "gui") || str_eq(cmd, "run desktop")) {
+        desktop_term_push_line("GUI already active.");
+    } else {
+        uint32_t cap = 0;
+
+        os_term_capture_begin();
+        shell_run_line(cmd);
+        os_term_capture_end(captured, sizeof(captured));
+
+        if (captured[0] == '\0') {
+            desktop_term_push_line("(no output)");
+        }
+
+        while (captured[cap]) {
+            uint32_t l = 0;
+
+            while (captured[cap] == '\r')
+                cap++;
+
+            while (captured[cap] && captured[cap] != '\n' && l < DESKTOP_TERM_COLS)
+                line[l++] = captured[cap++];
+
+            line[l] = '\0';
+            if (line[0] != '\0')
+                desktop_term_push_line(line);
+
+            while (captured[cap] && captured[cap] != '\n')
+                cap++;
+            if (captured[cap] == '\n')
+                cap++;
+        }
+
+        if (str_starts_with(shell_current_dir(), "/") &&
+            str_eq(cmd, "ls") == 0 && str_eq(cmd, "help") == 0 && str_eq(cmd, "clear") == 0) {
+            int idx = desktop_find_root_index(shell_current_dir() + 1);
+            if (idx >= 0)
+                desktop.explorer_selected = idx;
+        }
+
+        if (str_eq(cmd, "clear"))
+            desktop.term_count = 0;
+    }
+
+    desktop.term_input_len = 0;
+    desktop.term_input[0] = '\0';
+}
+
+static void desktop_render(void);
+
+static void desktop_handle_left_click(int x, int y)
+{
+    uint32_t fbw;
+    uint32_t fbh;
+    uint32_t margin;
+    uint32_t gap;
+    uint32_t taskbar_h;
+    uint32_t explorer_x;
+    uint32_t explorer_y;
+    uint32_t explorer_w;
+    uint32_t explorer_h;
+    uint32_t term_x;
+    uint32_t term_y;
+    uint32_t term_w;
+    uint32_t term_h;
+    uint32_t scale;
+    uint32_t line_h;
+
+    if (!vga_is_framebuffer())
+        return;
+
+    fbw = vga_fb_width();
+    fbh = vga_fb_height();
+    if (fbw < 640u || fbh < 400u)
+        return;
+
+    scale = vga_font_scale();
+    if (scale == 0u)
+        scale = 1u;
+    line_h = 16u * scale + 6u;
+    margin = 18u;
+    gap = 14u;
+    taskbar_h = 36u;
+
+    explorer_x = margin;
+    explorer_y = 48u;
+    explorer_w = fbw / 3u;
+    if (explorer_w < 220u)
+        explorer_w = 220u;
+    explorer_h = fbh - explorer_y - taskbar_h - margin;
+    term_x = explorer_x + explorer_w + gap;
+    term_y = explorer_y;
+    term_w = fbw - term_x - margin;
+    term_h = explorer_h;
+
+    if (y >= (int)(fbh - taskbar_h) && x >= 10 && x <= 104) {
+        desktop.menu_visible = !desktop.menu_visible;
+        desktop_render();
+        return;
+    }
+
+    if (desktop.menu_visible) {
+        uint32_t menu_x = 10u;
+        uint32_t menu_y = fbh - taskbar_h - 128u;
+        uint32_t item_h = 28u;
+        if ((uint32_t)x >= menu_x && (uint32_t)x < menu_x + 180u &&
+            (uint32_t)y >= menu_y && (uint32_t)y < menu_y + 110u) {
+            int item = (y - (int)menu_y - 10) / (int)item_h;
+            if (item >= 0 && item < DESKTOP_MENU_ITEMS) {
+                desktop.menu_selected = item;
+                if (item == 0)
+                    desktop.focus_terminal = 1;
+                else if (item == 1)
+                    desktop.focus_terminal = 0;
+                else
+                    os_power_shutdown();
+            }
+            desktop.menu_visible = 0;
+            desktop_render();
+            return;
+        }
+    }
+
+    if ((uint32_t)x >= explorer_x && (uint32_t)x < explorer_x + explorer_w &&
+        (uint32_t)y >= explorer_y + 38u && (uint32_t)y < explorer_y + explorer_h) {
+        int idx = (y - (int)(explorer_y + 42u)) / (int)line_h;
+        if (idx >= 0 && (uint32_t)idx < (uint32_t)(sizeof(desktop_root_entries) / sizeof(desktop_root_entries[0]))) {
+            desktop.explorer_selected = idx;
+            desktop.focus_terminal = 0;
+            desktop_render();
+            return;
+        }
+    }
+
+    if ((uint32_t)x >= term_x && (uint32_t)x < term_x + term_w &&
+        (uint32_t)y >= term_y && (uint32_t)y < term_y + term_h) {
+        desktop.focus_terminal = 1;
+        desktop_render();
+    }
+}
+
+static void desktop_render(void)
+{
+    uint32_t cols = vga_cols();
+    uint32_t rows = vga_rows();
+    uint32_t y;
+
+    if (!vga_is_framebuffer()) {
+        clear_screen(0x10);
+        center_text(1, "LC(OS) Desktop", 0x0F);
+        center_text(3, "Graphical desktop requires framebuffer video.", 0x0F);
+        center_text(5, "Boot with a framebuffer-capable video mode.", 0x07);
+        return;
+    }
+
+    {
+        uint32_t fbw = vga_fb_width();
+        uint32_t fbh = vga_fb_height();
+        uint32_t scale = vga_font_scale();
+        uint32_t line_h;
+        uint32_t margin = 18u;
+        uint32_t gap = 14u;
+        uint32_t taskbar_h = 36u;
+        uint32_t title_h = 28u;
+        uint32_t explorer_x;
+        uint32_t explorer_y;
+        uint32_t explorer_w;
+        uint32_t explorer_h;
+        uint32_t term_x;
+        uint32_t term_y;
+        uint32_t term_w;
+        uint32_t term_h;
+        uint32_t visible_lines;
+        uint32_t line_start;
+        uint32_t text_x;
+
+        if (scale == 0u)
+            scale = 1u;
+        line_h = 16u * scale + 6u;
+
+        if (fbw < 640u || fbh < 400u) {
+            clear_screen(0x10);
+            center_text(1, "LC(OS) Desktop", 0x0F);
+            center_text(3, "Display too small for GUI layout.", 0x0F);
+            center_text(5, "Use a larger framebuffer video mode.", 0x07);
+            return;
+        }
+
+        explorer_x = margin;
+        explorer_y = 48u;
+        explorer_w = fbw / 3u;
+        if (explorer_w < 220u)
+            explorer_w = 220u;
+        explorer_h = fbh - explorer_y - taskbar_h - margin;
+        term_x = explorer_x + explorer_w + gap;
+        term_y = explorer_y;
+        term_w = fbw - term_x - margin;
+        term_h = explorer_h;
+
+        vga_fill_rect_px(0u, 0u, fbw, fbh, 0x18324A);
+        vga_fill_rect_px(0u, 0u, fbw, 72u, 0x224E71);
+        vga_fill_rect_px(fbw - 180u, 24u, 120u, 120u, 0x2A5B84);
+        vga_fill_rect_px(fbw - 150u, 48u, 100u, 100u, 0x3F7BA8);
+        vga_draw_text_px("LC(OS) Desktop", 24u, 18u, 0xFFFFFF, 0x224E71);
+        vga_draw_text_px("Graphical mode", 24u, 18u + 20u * scale, 0xD8E8F4, 0x224E71);
+
+        vga_fill_rect_px(explorer_x, explorer_y, explorer_w, explorer_h, 0xE6EEF5);
+        vga_draw_rect_px(explorer_x, explorer_y, explorer_w, explorer_h, 0x284B63);
+        vga_fill_rect_px(explorer_x, explorer_y, explorer_w, title_h, desktop.focus_terminal ? 0x5E7386 : 0x3A5E7A);
+        vga_draw_text_px("File Explorer", explorer_x + 10u, explorer_y + 6u, 0xFFFFFF,
+                         desktop.focus_terminal ? 0x5E7386 : 0x3A5E7A);
+
+        for (y = 0; y < (uint32_t)(sizeof(desktop_root_entries) / sizeof(desktop_root_entries[0])); y++) {
+            uint32_t item_y = explorer_y + 42u + y * line_h;
+            uint32_t item_h = line_h - 2u;
+            uint32_t bg = ((int)y == desktop.explorer_selected) ? 0xB7D8F0 : 0xE6EEF5;
+            uint32_t fg = ((int)y == desktop.explorer_selected) ? 0x0F2F45 : 0x1C3446;
+            if (item_y + item_h > explorer_y + explorer_h - 10u)
+                break;
+            vga_fill_rect_px(explorer_x + 8u, item_y, explorer_w - 16u, item_h, bg);
+            vga_draw_text_px(desktop_root_entries[y], explorer_x + 18u, item_y + 2u, fg, bg);
+        }
+
+        vga_fill_rect_px(term_x, term_y, term_w, term_h, 0x121821);
+        vga_draw_rect_px(term_x, term_y, term_w, term_h, 0x284B63);
+        vga_fill_rect_px(term_x, term_y, term_w, title_h, desktop.focus_terminal ? 0x315F4A : 0x284B63);
+        vga_draw_text_px("Shell Terminal", term_x + 10u, term_y + 6u, 0xFFFFFF,
+                         desktop.focus_terminal ? 0x315F4A : 0x284B63);
+
+        visible_lines = (term_h - title_h - line_h - 22u) / line_h;
+        if (visible_lines == 0u)
+            visible_lines = 1u;
+        line_start = desktop.term_count > visible_lines ? desktop.term_count - visible_lines : 0u;
+        text_x = term_x + 12u;
+        for (y = 0; y + line_start < desktop.term_count && y < visible_lines; y++) {
+            uint32_t line_y = term_y + title_h + 10u + y * line_h;
+            vga_draw_text_px(desktop.term_lines[line_start + y], text_x, line_y, 0xD9E7F1, 0x121821);
+        }
+
+        vga_fill_rect_px(term_x + 8u, term_y + term_h - line_h - 12u, term_w - 16u, line_h + 4u, 0x0C1118);
+        vga_draw_rect_px(term_x + 8u, term_y + term_h - line_h - 12u, term_w - 16u, line_h + 4u, 0x456A85);
+        vga_draw_text_px("$", term_x + 16u, term_y + term_h - line_h - 8u, 0x8EE5B6, 0x0C1118);
+        vga_draw_text_px(desktop.term_input, term_x + 32u, term_y + term_h - line_h - 8u, 0xFFFFFF, 0x0C1118);
+
+        vga_fill_rect_px(0u, fbh - taskbar_h, fbw, taskbar_h, 0x10283C);
+        vga_draw_rect_px(0u, fbh - taskbar_h, fbw, taskbar_h, 0x284B63);
+        vga_fill_rect_px(10u, fbh - taskbar_h + 4u, 94u, taskbar_h - 8u, 0x2A5B84);
+        vga_draw_rect_px(10u, fbh - taskbar_h + 4u, 94u, taskbar_h - 8u, 0x6EA6CF);
+        vga_draw_text_px("Start", 28u, fbh - taskbar_h + 9u, 0xFFFFFF, 0x2A5B84);
+
+        if (desktop.menu_visible) {
+            static const char *const menu_items[DESKTOP_MENU_ITEMS] = { "Terminal", "Explorer", "Shutdown" };
+            uint32_t menu_x = 10u;
+            uint32_t menu_y = fbh - taskbar_h - 128u;
+            vga_fill_rect_px(menu_x, menu_y, 180u, 110u, 0xE6EEF5);
+            vga_draw_rect_px(menu_x, menu_y, 180u, 110u, 0x284B63);
+            for (y = 0; y < DESKTOP_MENU_ITEMS; y++) {
+                uint32_t item_y = menu_y + 10u + y * 28u;
+                uint32_t bg = ((int)y == desktop.menu_selected) ? 0xB7D8F0 : 0xE6EEF5;
+                uint32_t fg = ((int)y == desktop.menu_selected) ? 0x0F2F45 : 0x1C3446;
+                vga_fill_rect_px(menu_x + 8u, item_y, 164u, 24u, bg);
+                vga_draw_text_px(menu_items[y], menu_x + 18u, item_y + 4u, fg, bg);
+            }
+        }
+
+        {
+            int mx;
+            int my;
+            uint8_t buttons;
+
+            os_mouse_get_state(&mx, &my, &buttons);
+            if (mx >= 0 && my >= 0 && (uint32_t)mx + 12u < fbw && (uint32_t)my + 18u < fbh) {
+                vga_fill_rect_px((uint32_t)mx, (uint32_t)my, 2u, 18u, 0xFFFFFF);
+                vga_fill_rect_px((uint32_t)mx, (uint32_t)my, 12u, 2u, 0xFFFFFF);
+                vga_fill_rect_px((uint32_t)mx + 2u, (uint32_t)my + 2u, 2u, 12u, 0xFFFFFF);
+                vga_fill_rect_px((uint32_t)mx + 4u, (uint32_t)my + 4u, 2u, 8u, 0xFFFFFF);
+                if ((buttons & 0x01u) != 0u)
+                    vga_fill_rect_px((uint32_t)mx + 6u, (uint32_t)my + 12u, 6u, 3u, 0xFFE082);
+            }
+        }
+    }
+
+    (void)cols;
+    (void)rows;
+}
+
+int games_launch_desktop(void)
+{
+    uint32_t i;
+    int mx;
+    int my;
+    uint8_t buttons;
+
+    os_cursor_hide();
+    save_screen();
+    active_game = GAME_DESKTOP;
+    last_tick = 0;
+    desktop.menu_visible = 0;
+    desktop.menu_selected = 0;
+    desktop.focus_terminal = 1;
+    desktop.explorer_selected = 0;
+    desktop.term_count = 0;
+    desktop.term_input_len = 0;
+    desktop.term_input[0] = '\0';
+
+    os_mouse_get_state(&mx, &my, &buttons);
+    desktop.mouse_x = mx;
+    desktop.mouse_y = my;
+
+    for (i = 0; i < DESKTOP_TERM_LINES; i++)
+        desktop.term_lines[i][0] = '\0';
+
+    desktop_term_push_line("LC(OS) GUI ready.");
+    desktop_term_push_line("Type help in terminal pane.");
+    desktop_render();
+    return 1;
+}
+
 static void editor_render(void)
 {
     uint32_t cols = vga_cols();
     uint32_t rows = vga_rows();
-    uint32_t usable_bottom = rows > 2 ? rows - 3 : rows;
+    uint32_t usable_bottom = rows > 0 ? rows - 1 : 0;
     uint32_t r;
     uint32_t c = 0;
     uint32_t i = 0;
@@ -250,15 +655,6 @@ static void editor_render(void)
         put_text(0, 6, editor.path, ATTR_TEXT);
         center_text(1, "Text Editor", ATTR_MUTED);
         put_text(3, 0, "Ctrl+S Save  |  Ctrl+E Exit  |  Arrows Move  |  Enter New line", ATTR_TEXT);
-
-        if (rows >= 2) {
-            uint32_t help_col;
-            for (help_col = 0; help_col < cols; help_col++)
-                vga_put_at('-', ATTR_MUTED, rows - 2, help_col);
-            for (help_col = 0; help_col < cols; help_col++)
-                vga_put_at(' ', ATTR_TEXT, rows - 1, help_col);
-            put_text(rows - 1, 0, " Ctrl+S: Save  |  Ctrl+E: Exit  |  Arrows: Move  |  Enter: New line ", ATTR_TEXT);
-        }
 
         editor_frame_initialized = 1;
         editor_frame_cols = cols;
@@ -865,6 +1261,8 @@ int games_start_path(const char *path)
         return games_launch_tetris();
     if (str_eq(name, "pingpong"))
         return games_launch_pingpong();
+    if (str_eq(name, "desktop") || str_eq(name, "gui"))
+        return games_launch_desktop();
 
     return 0;
 }
@@ -964,7 +1362,104 @@ void games_handle_event(const struct key_event *event)
         return;
     }
 
-    if (active_game == GAME_SNAKE) {
+    if (active_game == GAME_DESKTOP) {
+        if (event->type == KEY_TAB) {
+            desktop.focus_terminal = !desktop.focus_terminal;
+            desktop_render();
+            return;
+        }
+
+        if (event->type == KEY_CHAR && (event->ch == 's' || event->ch == 'S')) {
+            desktop.menu_visible = !desktop.menu_visible;
+            desktop_render();
+            return;
+        }
+
+        if (desktop.menu_visible) {
+            if (event->type == KEY_UP) {
+                if (desktop.menu_selected > 0)
+                    desktop.menu_selected--;
+                desktop_render();
+                return;
+            }
+            if (event->type == KEY_DOWN) {
+                if (desktop.menu_selected + 1 < DESKTOP_MENU_ITEMS)
+                    desktop.menu_selected++;
+                desktop_render();
+                return;
+            }
+            if (event->type == KEY_ENTER) {
+                if (desktop.menu_selected == 0)
+                    desktop.focus_terminal = 1;
+                else if (desktop.menu_selected == 1)
+                    desktop.focus_terminal = 0;
+                else
+                    os_power_shutdown();
+
+                desktop.menu_visible = 0;
+                desktop_render();
+                return;
+            }
+        }
+
+        if (!desktop.focus_terminal) {
+            if (event->type == KEY_UP) {
+                if (desktop.explorer_selected > 0)
+                    desktop.explorer_selected--;
+                desktop_render();
+            } else if (event->type == KEY_DOWN) {
+                uint32_t max_items = (uint32_t)(sizeof(desktop_root_entries) / sizeof(desktop_root_entries[0]));
+                if ((uint32_t)(desktop.explorer_selected + 1) < max_items)
+                    desktop.explorer_selected++;
+                desktop_render();
+            } else if (event->type == KEY_ENTER) {
+                char line[80];
+                uint32_t i = 0;
+                const char *name = desktop_root_entries[desktop.explorer_selected];
+                const char *prefix = "Selected /";
+
+                while (prefix[i] && i + 1 < sizeof(line)) {
+                    line[i] = prefix[i];
+                    i++;
+                }
+                {
+                    uint32_t j = 0;
+                    while (name[j] && i + 1 < sizeof(line))
+                        line[i++] = name[j++];
+                }
+                line[i] = '\0';
+                desktop_term_push_line(line);
+                desktop_render();
+            }
+            return;
+        }
+
+        if (event->type == KEY_BACKSPACE) {
+            if (desktop.term_input_len > 0) {
+                desktop.term_input_len--;
+                desktop.term_input[desktop.term_input_len] = '\0';
+                desktop_render();
+            }
+            return;
+        }
+
+        if (event->type == KEY_ENTER) {
+            desktop_execute_command();
+            desktop_render();
+            return;
+        }
+
+        if (event->type == KEY_CHAR && event->ch >= 32 && event->ch <= 126) {
+            if (desktop.term_input_len < DESKTOP_INPUT_MAX) {
+                desktop.term_input[desktop.term_input_len++] = event->ch;
+                desktop.term_input[desktop.term_input_len] = '\0';
+                desktop_render();
+            }
+            return;
+        }
+
+        return;
+    } else if (active_game == GAME_SNAKE) {
         if (event->type == KEY_LEFT && snake.dir_x != 1) {
             snake.dir_x = -1;
             snake.dir_y = 0;
@@ -1022,6 +1517,24 @@ void games_tick(uint32_t ticks)
 
     if (active_game == GAME_EDITOR)
         return;
+    if (active_game == GAME_DESKTOP) {
+        int mx;
+        int my;
+        int click_x;
+        int click_y;
+
+        os_mouse_get_state(&mx, &my, 0);
+        if (mx != desktop.mouse_x || my != desktop.mouse_y) {
+            desktop.mouse_x = mx;
+            desktop.mouse_y = my;
+            desktop_render();
+        }
+
+        if (os_mouse_consume_left_click(&click_x, &click_y))
+            desktop_handle_left_click(click_x, click_y);
+
+        return;
+    }
 
     interval = active_game == GAME_TETRIS ? 8u : 4u;
     if (ticks == last_tick || ticks - last_tick < interval)

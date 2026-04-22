@@ -131,6 +131,21 @@ int vga_is_framebuffer(void)
     return fb_active;
 }
 
+uint32_t vga_fb_width(void)
+{
+    return fb_width;
+}
+
+uint32_t vga_fb_height(void)
+{
+    return fb_height;
+}
+
+uint32_t vga_font_scale(void)
+{
+    return fb_cell_scale;
+}
+
 uint32_t vga_cols(void)
 {
     return vga_cols_value;
@@ -188,6 +203,94 @@ static void fb_draw_char(char c, uint8_t attr, uint32_t row, uint32_t col)
                                    color);
             }
         }
+    }
+}
+
+static void fb_draw_char_px(char c, uint32_t x, uint32_t y, uint32_t fg_rgb, uint32_t bg_rgb)
+{
+    uint32_t cell_w = FONT_W * fb_cell_scale;
+    uint32_t cell_h = FONT_H * fb_cell_scale;
+    uint32_t gy;
+    uint32_t gx;
+    uint8_t glyph_idx = (uint8_t)c;
+
+    if (!fb_active)
+        return;
+    if (x + cell_w > fb_width || y + cell_h > fb_height)
+        return;
+
+    for (gy = 0; gy < (uint32_t)FONT_H; gy++) {
+        uint8_t bits = font8x16[glyph_idx][gy];
+
+        for (gx = 0; gx < (uint32_t)FONT_W; gx++) {
+            uint32_t color = (bits & (1u << gx)) ? fg_rgb : bg_rgb;
+            uint32_t sy;
+            uint32_t sx;
+
+            for (sy = 0; sy < fb_cell_scale; sy++) {
+                for (sx = 0; sx < fb_cell_scale; sx++)
+                    fb_write_pixel(x + gx * fb_cell_scale + sx,
+                                   y + gy * fb_cell_scale + sy,
+                                   color);
+            }
+        }
+    }
+}
+
+void vga_fill_rect_px(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t rgb)
+{
+    uint32_t px;
+    uint32_t py;
+
+    if (!fb_active || width == 0u || height == 0u)
+        return;
+    if (x >= fb_width || y >= fb_height)
+        return;
+    if (x + width > fb_width)
+        width = fb_width - x;
+    if (y + height > fb_height)
+        height = fb_height - y;
+
+    for (py = y; py < y + height; py++) {
+        for (px = x; px < x + width; px++)
+            fb_write_pixel(px, py, rgb);
+    }
+}
+
+void vga_draw_rect_px(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t rgb)
+{
+    if (!fb_active || width == 0u || height == 0u)
+        return;
+
+    vga_fill_rect_px(x, y, width, 1u, rgb);
+    if (height > 1u)
+        vga_fill_rect_px(x, y + height - 1u, width, 1u, rgb);
+    if (height > 2u)
+        vga_fill_rect_px(x, y + 1u, 1u, height - 2u, rgb);
+    if (width > 1u && height > 2u)
+        vga_fill_rect_px(x + width - 1u, y + 1u, 1u, height - 2u, rgb);
+}
+
+void vga_draw_text_px(const char *s, uint32_t x, uint32_t y, uint32_t fg_rgb, uint32_t bg_rgb)
+{
+    uint32_t start_x = x;
+    uint32_t step_x = FONT_W * fb_cell_scale;
+    uint32_t step_y = FONT_H * fb_cell_scale;
+
+    if (!fb_active || s == 0)
+        return;
+
+    while (*s) {
+        if (*s == '\n') {
+            y += step_y;
+            x = start_x;
+            s++;
+            continue;
+        }
+
+        fb_draw_char_px(*s, x, y, fg_rgb, bg_rgb);
+        x += step_x;
+        s++;
     }
 }
 

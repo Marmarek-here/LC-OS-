@@ -3,6 +3,7 @@
 int program_launch_snake(const char *name);
 int program_launch_tetris(const char *name);
 int program_launch_pingpong(const char *name);
+int program_launch_desktop(const char *name);
 
 static const char *path_basename(const char *path)
 {
@@ -24,6 +25,8 @@ int programs_launch_path(const char *path)
     if (program_launch_tetris(name))
         return 1;
     if (program_launch_pingpong(name))
+        return 1;
+    if (program_launch_desktop(name))
         return 1;
 
     return 0;

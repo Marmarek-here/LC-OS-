@@ -1816,7 +1816,7 @@ static int cmd_touch(const char *args)
     }
 
     if (!os_fs_write_file(fullpath, "")) {
-        os_term_puts("Failed to create file (storage full)", OS_ATTR_MUTED);
+        os_term_puts("Failed to create file (invalid target or storage full)", OS_ATTR_MUTED);
         return 1;
     }
 
@@ -2183,6 +2183,18 @@ static int cmd_tasks(const char *args)
     return 1;
 }
 
+static int cmd_gui(const char *args)
+{
+    (void)args;
+
+    if (!os_game_launch("/programs/desktop")) {
+        os_term_puts("GUI launch failed", OS_ATTR_MUTED);
+        return -1;
+    }
+
+    return 1;
+}
+
 static const struct builtin_command command_table[] = {
     { "help", "show available commands", 0 },
     { "ls", "list files/directories", cmd_ls },
@@ -2204,6 +2216,7 @@ static const struct builtin_command command_table[] = {
     { "rmdir", "remove empty directory", cmd_rmdir },
     { "rmfile", "remove non-directory file", cmd_rmfile },
     { "tasks", "show scheduler tasks/status", cmd_tasks },
+    { "gui", "launch desktop GUI", cmd_gui },
     { "date", "show current RTC date/time", cmd_date },
     { "shutdown", "power off the machine", cmd_shutdown },
     { "reboot", "restart the machine", cmd_reboot }

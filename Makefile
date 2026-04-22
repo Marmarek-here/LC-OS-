@@ -9,6 +9,7 @@
 #   make        — compile + link kernel ELF
 #   make iso    — wrap into a bootable ISO image
 #   make run    — launch in QEMU (no window, serial console)
+#   make run-uefi — launch in QEMU via OVMF (UEFI firmware)
 #   make clean  — remove all build artefacts
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -53,10 +54,12 @@ ISO_IMG    := lcos.iso
 FS_HEADER   := $(BUILD)/filesystem_entries.h
 FS_DATA_HEADER := $(BUILD)/filesystem_data.h
 
-OBJS := $(BUILD)/boot.o $(BUILD)/interrupts.o $(BUILD)/kernel.o $(BUILD)/shell.o $(BUILD)/builtin_commands.o $(BUILD)/vga.o $(BUILD)/games.o $(BUILD)/reboot_state.o $(BUILD)/program_registry.o $(BUILD)/program_snake.o $(BUILD)/program_tetris.o $(BUILD)/program_pingpong.o
+OBJS := $(BUILD)/boot.o $(BUILD)/interrupts.o $(BUILD)/kernel.o $(BUILD)/shell.o $(BUILD)/builtin_commands.o $(BUILD)/vga.o $(BUILD)/games.o $(BUILD)/reboot_state.o $(BUILD)/scheduler.o $(BUILD)/gdt.o $(BUILD)/program_registry.o $(BUILD)/program_snake.o $(BUILD)/program_tetris.o $(BUILD)/program_pingpong.o $(BUILD)/program_desktop.o
 
 # ─────────────────────────────────────────────────────────────────────────────
 .PHONY: all iso run run-i386 run-x86_64 clean
+
+OVMF ?= /usr/share/OVMF/OVMF_CODE.fd
 
 all: $(KERNEL_ELF) $(FS_IMAGE)
 
@@ -85,6 +88,12 @@ $(BUILD)/games.o: $(SRC_DIR)/games.c | $(BUILD)
 $(BUILD)/reboot_state.o: $(SRC_DIR)/reboot_state.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/scheduler.o: $(SRC_DIR)/scheduler.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/gdt.o: $(SRC_DIR)/gdt.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/program_registry.o: $(SRC_DIR)/programs/program_registry.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -95,6 +104,9 @@ $(BUILD)/program_tetris.o: $(SRC_DIR)/programs/tetris.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/program_pingpong.o: $(SRC_DIR)/programs/pingpong.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/program_desktop.o: $(SRC_DIR)/programs/desktop.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(FS_HEADER): $(FS_TREE) | $(BUILD)
@@ -185,6 +197,20 @@ run-x86_64: $(ISO_IMG)
 
 run-i386: $(ISO_IMG)
 	qemu-system-i386 \
+	    -boot order=dc \
+	    -cdrom $(ISO_IMG) \
+	    -drive file=$(FS_IMAGE),format=raw,if=ide,index=0,media=disk \
+	    -m 128M \
+	    -vga std \
+	    -display gtk,zoom-to-fit=off,gl=off \
+	    -no-reboot \
+	    -no-shutdown
+
+run-uefi: $(ISO_IMG)
+	@test -f $(OVMF) || (echo "[ERR] OVMF not found at $(OVMF). Set OVMF=/path/to/OVMF_CODE.fd" && exit 1)
+	qemu-system-x86_64 \
+	    -machine q35 \
+	    -bios $(OVMF) \
 	    -boot order=dc \
 	    -cdrom $(ISO_IMG) \
 	    -drive file=$(FS_IMAGE),format=raw,if=ide,index=0,media=disk \

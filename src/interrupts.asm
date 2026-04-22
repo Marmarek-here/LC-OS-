@@ -5,10 +5,12 @@ global interrupt_ignore_stub
 global exception_stub_table
 global irq0_stub
 global irq1_stub
+global irq12_stub
 
 extern exception_handler_c
 extern irq0_handler_c
 extern irq1_handler_c
+extern irq12_handler_c
 
 %macro EXCEPTION_STUB_NOERR 1
 global exception_stub_%1
@@ -96,5 +98,11 @@ irq0_stub:
 irq1_stub:
     pusha
     call irq1_handler_c
+    popa
+    iretd
+
+irq12_stub:
+    pusha
+    call irq12_handler_c
     popa
     iretd

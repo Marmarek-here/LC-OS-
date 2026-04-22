@@ -19,6 +19,13 @@ void vga_set_framebuffer(uint32_t addr, uint32_t pitch,
                          uint32_t width, uint32_t height, uint8_t bpp);
 
 int vga_is_framebuffer(void);
+uint32_t vga_fb_width(void);
+uint32_t vga_fb_height(void);
+uint32_t vga_font_scale(void);
+
+void vga_fill_rect_px(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t rgb);
+void vga_draw_rect_px(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t rgb);
+void vga_draw_text_px(const char *s, uint32_t x, uint32_t y, uint32_t fg_rgb, uint32_t bg_rgb);
 
 uint16_t vga_entry(char c, uint8_t attr);
 uint16_t vga_get_cell(uint32_t row, uint32_t col);
